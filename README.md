@@ -1,9 +1,9 @@
-# Underwater Neuroevolution (Rust, 3D)
+# Learning to Walk (Rust, 3D)
 
-A 3D tank of fish, jellyfish and sharks, each steered by its own small neural network.
-Nothing is scripted and there is no gradient training. Behavior emerges through **neuroevolution**:
-creatures that eat well live long enough to reproduce, and their children inherit a mutated
-(and sometimes crossed-over) copy of the parents' brains.
+A physics-simulated person on a running track learns to walk from scratch.
+Its muscles are joint motors, its brain is a small neural network, and nothing about walking is
+programmed in. A trainer in the background improves the brain with **evolution strategies**.
+The window shows one person: the best brain found so far, trying to walk as far as it can in 15 seconds.
 
 ## Run
 
@@ -11,63 +11,49 @@ creatures that eat well live long enough to reproduce, and their children inheri
 cargo run --release
 ```
 
-The first build downloads and compiles macroquad, which takes about a minute.
+The first build downloads and compiles macroquad (graphics) and rapier3d (physics), which takes a minute or two.
 
-## The ecosystem
+## What you'll see
 
-| Species | Eats | Danger | Notes |
-|---|---|---|---|
-| Plankton (green specks) | — | everything | Spawns near the sunlit surface, drifts with the current |
-| Fish (orange) | plankton | sharks, jellyfish | Fast and agile, breeds quickly |
-| Jellyfish (pink, translucent) | plankton | — | Slow drifters whose tentacles sting fish and sharks |
-| Shark (grey) | fish | jellyfish | Fast apex predator, digests between kills |
+- **First minute:** the person stands, wobbles, and shuffles a little.
+- **About 1 minute in (~60 generations):** it starts taking real steps.
+- **About 3 minutes in (~250 generations):** it walks roughly 20 m in 15 s, about 1.5 m/s,
+  with alternating steps (measured in the test below).
 
-Dead creatures that weren't eaten sink back into the food web as plankton ("marine snow").
+Training keeps going for as long as the window is open. The best brain is saved to `walker_brain.txt`,
+and the next run picks up from it. Press **R** to forget everything and start over.
 
-## The brains
+## How it works
 
-Each creature has a feed-forward network: **19 inputs, 14 hidden (tanh), 5 outputs**.
+**Body** (`src/walker.rs`): a ~75 kg ragdoll made of 9 rigid parts (torso with head, thighs,
+shins, feet, arms) connected by 8 motorized joints. The hips can swing forward/back and out to the side;
+knees, ankles and shoulders swing forward/back. Physics runs at 240 Hz in [rapier3d](https://rapier.rs).
 
-- **Inputs**: direction and closeness of the nearest food, threat and same-species neighbor;
-  its own velocity, position in the tank and energy; an internal clock; a memory value; a bias.
-- **Outputs**: a 3D thrust direction, a throttle, and a memory value that is fed back next tick.
+**Brain** (`src/brain.rs`): a network with 18 inputs, 16 hidden neurons and 5 outputs that runs 60 times a second.
+- **Inputs:** a gait-rhythm clock; torso lean and its rate of change; height; speed; this leg's and the
+  other leg's joint angles; which feet are touching the ground.
+- **Outputs:** target angles for the hip (forward and sideways), knee, ankle and shoulder.
 
-**Evolution:**
-- A creature with enough energy, age and cooldown reproduces. If another of its species is
-  nearby, the child gets a neuron-wise crossover of both brains; otherwise a clone. Then ~12%
-  of its weights are mutated with gaussian noise.
-- Every species keeps a **hall of fame** of its fittest genomes (meals, children, lifespan).
-  When a population falls below its minimum, it's re-seeded from those elites instead of
-  going extinct.
-- Lineages carry a heritable color tint, so successful families become visible as color clusters.
+The **same network drives both legs**. The right leg gets mirrored inputs and runs half a stride behind
+the left leg, so the gaits it finds come out symmetric.
 
-Starting from random brains, the creatures at first mostly drift and starve. Within roughly 10–20
-simulated minutes, fish learn to chase plankton and the populations take off. Press **T** for
-turbo to get there in seconds.
+**Training** (`src/trainer.rs`): every generation, the trainer makes 96 slightly jittered copies of the
+current brain, in +/- pairs. Each copy gets one 15-second walking attempt, simulated headless on all CPU cores.
+The trainer then moves the brain's weights toward the jitters that scored better (OpenAI-style ES with the Adam optimizer).
+
+**Score:** distance walked, plus a small bonus for staying up and a small penalty for veering sideways.
+An attempt ends early if the person falls (torso too low or tilted, or head too low).
 
 ## Controls
 
 | Input | Action |
 |---|---|
-| Left-drag / wheel / WASD QE | Orbit / zoom / pan the camera |
-| Click | Select a creature: shows its stats, live neural activity, and lines to what it sees (green food, red threat) |
-| F | Follow the selected creature |
-| B / N / Esc | Select the fittest / a random creature / deselect |
-| Space | Pause |
-| + / - | Simulation speed (0.25x to 16x) |
-| T | Turbo: run as many steps as possible |
-| [ / ] | Lower / raise the plankton spawn rate |
-| G / H | Toggle the population graph / help |
-| R | Restart with fresh random brains |
-
-## Code layout
-
-- `src/brain.rs`: neural network, mutation and crossover
-- `src/creature.rs`: species biology (all tunable numbers live in `PARAMS`)
-- `src/world.rs`: the simulation step (sensing, thinking, physics, eating, birth/death, hall of fame) and a spatial grid
-- `src/render.rs`: CPU-lit, fogged meshes for creatures, sand, rocks, seaweed, bubbles, water surface
-- `src/hud.rs`: stats, population graph, brain visualizer
-- `src/main.rs`: window, camera, input, main loop
+| Left-drag / wheel | Orbit / zoom the camera (it follows the person) |
+| N | Restart the attempt now with the latest champion |
+| Space / + / - | Pause the view / change view speed (0.25x to 8x) |
+| P | Pause or resume training |
+| R | Forget all training (deletes `walker_brain.txt`) and start over |
+| B / G / H | Toggle the live brain view / learning-curve graph / help |
 
 ## Test
 
@@ -75,5 +61,5 @@ turbo to get there in seconds.
 cargo test --release -- --nocapture
 ```
 
-This runs 10 headless simulated minutes and prints population and generation numbers.
-Set `SIM_MINUTES=60` for a longer run.
+This runs 15 generations of headless training, then checks the champion's gait (time airborne,
+single- vs double-leg stance, step rate). Set `GENERATIONS=250` for a longer run.

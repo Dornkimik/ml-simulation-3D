@@ -1,15 +1,27 @@
-//! 3D rendering. Macroquad has no built-in lighting, so meshes are lit and
-//! fogged per vertex on the CPU and submitted in large batches.
+//! 3D rendering of the field and the person. Macroquad has no built-in
+//! lighting, so meshes are lit and fogged per vertex on the CPU and submitted
+//! in large batches.
 
 use macroquad::models::{Mesh, Vertex};
 use macroquad::prelude::*;
 use macroquad::rand::gen_range;
 
-use crate::creature::{Creature, Species};
-use crate::world::{World, TANK_MAX, TANK_MIN};
+use crate::walker::{
+    PartKind, PartPose, ARM_HALF_LEN, ARM_RADIUS, FOOT_HALF, HEAD_OFFSET, HEAD_RADIUS, SHIN_HALF_LEN, SHIN_RADIUS,
+    THIGH_HALF_LEN, THIGH_RADIUS, TRUNK_HALF,
+};
 
-pub const WATER_COLOR: Color = Color::new(0.02, 0.16, 0.27, 1.0);
+pub const SKY_TOP: Color = Color::new(0.33, 0.56, 0.86, 1.0);
+pub const HORIZON: Color = Color::new(0.78, 0.86, 0.93, 1.0);
 const BATCH_VERTS: usize = 30_000;
+
+const SKIN: Color = Color::new(0.93, 0.74, 0.6, 1.0);
+const SHIRT: Color = Color::new(0.2, 0.5, 0.85, 1.0);
+const SHORTS: Color = Color::new(0.16, 0.18, 0.27, 1.0);
+const SHOE: Color = Color::new(0.85, 0.27, 0.2, 1.0);
+const SOCK: Color = Color::new(0.95, 0.95, 0.95, 1.0);
+const HAIR: Color = Color::new(0.27, 0.17, 0.1, 1.0);
+const EYE: Color = Color::new(0.05, 0.05, 0.07, 1.0);
 
 /// Per-frame lighting context.
 pub struct Shading {
@@ -19,29 +31,25 @@ pub struct Shading {
 
 impl Shading {
     pub fn new(cam_pos: Vec3) -> Self {
-        Self { cam_pos, light_dir: vec3(0.35, 1.0, 0.25).normalize() }
+        Self { cam_pos, light_dir: vec3(-0.4, 1.0, 0.55).normalize() }
     }
 
-    fn shade(&self, pos: Vec3, normal: Vec3, base: Color, two_sided: bool) -> Color {
-        let mut d = normal.dot(self.light_dir);
-        if two_sided {
-            d = d.abs();
-        }
-        let diffuse = d.max(0.0);
-        // Water absorbs sunlight, so deeper things are darker.
-        let depth = 0.5 + 0.5 * ((pos.y - TANK_MIN.y) / (TANK_MAX.y - TANK_MIN.y)).clamp(0.0, 1.0);
-        let light = (0.32 + 0.68 * diffuse) * depth;
-        let lit = Color::new(base.r * light, base.g * light, base.b * light, base.a);
-        self.fog(pos, lit)
+    fn shade(&self, pos: Vec3, normal: Vec3, base: Color) -> Color {
+        let diffuse = normal.dot(self.light_dir).max(0.0);
+        // Sky light from above plus a little bounce light from the ground.
+        let ambient = 0.42 + 0.12 * normal.y;
+        let light = ambient + 0.62 * diffuse;
+        self.fog(pos, Color::new(base.r * light, base.g * light, base.b * light, base.a))
     }
 
+    /// Distant things fade into the hazy horizon.
     fn fog(&self, pos: Vec3, c: Color) -> Color {
         let dist = pos.distance(self.cam_pos);
-        let f = 1.0 - (-(dist - 10.0).max(0.0) * 0.009).exp();
+        let f = 1.0 - (-(dist - 25.0).max(0.0) * 0.011).exp();
         Color::new(
-            c.r + (WATER_COLOR.r - c.r) * f,
-            c.g + (WATER_COLOR.g - c.g) * f,
-            c.b + (WATER_COLOR.b - c.b) * f,
+            c.r + (HORIZON.r - c.r) * f,
+            c.g + (HORIZON.g - c.g) * f,
+            c.b + (HORIZON.b - c.b) * f,
             c.a,
         )
     }
@@ -76,34 +84,37 @@ impl Batch {
         }
     }
 
+    /// A flat quad, lit with its own face normal.
     fn quad(&mut self, sh: &Shading, p: [Vec3; 4], color: Color) {
         let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+        let n = if n.y < 0.0 { -n } else { n };
         let base = self.reserve(4);
         for v in p {
-            let c = sh.shade(v, n, color, true);
+            let c = sh.shade(v, n, color);
             self.vertex(v, c);
         }
         self.mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
+
+    /// A flat disc on the ground, for blob shadows. Not lit or fogged.
+    fn disc(&mut self, center: Vec3, rx: f32, rz: f32, color: Color) {
+        let n = 16;
+        let base = self.reserve(n + 1);
+        self.vertex(center, color);
+        let rim = Color::new(color.r, color.g, color.b, 0.0);
+        for i in 0..n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            self.vertex(center + vec3(a.cos() * rx, 0.0, a.sin() * rz), rim);
+        }
+        for i in 0..n as u16 {
+            self.mesh.indices.extend_from_slice(&[base, base + 1 + i, base + 1 + (i + 1) % n as u16]);
+        }
+    }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Mat {
-    Body,
-    Belly,
-    Fin,
-    Eye,
-}
-
-struct ModelVert {
-    pos: Vec3,
-    normal: Vec3,
-    mat: Mat,
-}
-
-/// A creature mesh in local space: +x forward, +y up, +z right.
+/// A mesh in local space with per-vertex colors and normals.
 pub struct Model {
-    verts: Vec<ModelVert>,
+    verts: Vec<(Vec3, Vec3, Color)>,
     indices: Vec<u16>,
 }
 
@@ -112,466 +123,266 @@ impl Model {
         Self { verts: Vec::new(), indices: Vec::new() }
     }
 
-    /// Adds a body of revolution along the x axis. `profile(t)` gives the
-    /// radius (0..1) at t = +1 (nose) through t = -1 (tail).
-    fn body(&mut self, half_len: f32, height: f32, width: f32, profile: impl Fn(f32) -> f32) {
-        let (segs, ring) = (14, 10);
+    /// A capsule along the y axis. `color(y, normal)` picks each vertex's
+    /// color, which is how clothes, skin and hair are painted on.
+    fn capsule(&mut self, center: Vec3, half_len: f32, radius: f32, color: impl Fn(f32, Vec3) -> Color) {
+        let (half_rings, slices) = (5, 14);
         let start = self.verts.len() as u16;
-        for i in 0..=segs {
-            let t = 1.0 - 2.0 * i as f32 / segs as f32;
-            let r = profile(t);
-            for j in 0..ring {
-                let a = j as f32 / ring as f32 * std::f32::consts::TAU;
-                let (s, c) = a.sin_cos();
-                let pos = vec3(t * half_len, c * r * height, s * r * width);
-                let normal = vec3(t * 0.4, c / height, s / width).normalize();
-                let mat = if c < -0.35 { Mat::Belly } else { Mat::Body };
-                self.verts.push(ModelVert { pos, normal, mat });
+        let mut rows = 0;
+        for (lo, hi, y_off) in [(-1.0f32, 0.0f32, -half_len), (0.0, 1.0, half_len)] {
+            for i in 0..=half_rings {
+                let theta = (lo + (hi - lo) * i as f32 / half_rings as f32) * std::f32::consts::FRAC_PI_2;
+                let (st, ct) = theta.sin_cos();
+                for j in 0..slices {
+                    let phi = j as f32 / slices as f32 * std::f32::consts::TAU;
+                    let n = vec3(ct * phi.cos(), st, ct * phi.sin());
+                    let local = vec3(n.x * radius, y_off + st * radius, n.z * radius);
+                    self.verts.push((center + local, n, color(local.y, n)));
+                }
+                rows += 1;
             }
         }
-        for i in 0..segs {
-            for j in 0..ring {
-                let a = start + (i * ring + j) as u16;
-                let b = start + (i * ring + (j + 1) % ring) as u16;
-                let c = a + ring as u16;
-                let d = b + ring as u16;
-                self.indices.extend_from_slice(&[a, c, b, b, c, d]);
-            }
-        }
-    }
-
-    /// Adds a dome (jellyfish bell) around the +y axis.
-    fn dome(&mut self, radius: f32, height: f32) {
-        let (rings, slices) = (8, 16);
-        let start = self.verts.len() as u16;
-        for i in 0..=rings {
-            let theta = i as f32 / rings as f32 * 1.75;
-            let (st, ct) = theta.sin_cos();
+        for r in 0..rows - 1 {
             for j in 0..slices {
-                let a = j as f32 / slices as f32 * std::f32::consts::TAU;
-                let (s, c) = a.sin_cos();
-                let pos = vec3(c * st * radius, ct * height, s * st * radius);
-                let normal = vec3(c * st / radius, ct / height, s * st / radius).normalize();
-                let mat = if i == rings { Mat::Belly } else { Mat::Body };
-                self.verts.push(ModelVert { pos, normal, mat });
-            }
-        }
-        for i in 0..rings {
-            for j in 0..slices {
-                let a = start + (i * slices + j) as u16;
-                let b = start + (i * slices + (j + 1) % slices) as u16;
-                self.indices.extend_from_slice(&[a, a + slices as u16, b, b, a + slices as u16, b + slices as u16]);
+                let a = start + (r * slices + j) as u16;
+                let b = start + (r * slices + (j + 1) % slices) as u16;
+                let s = slices as u16;
+                self.indices.extend_from_slice(&[a, a + s, b, b, a + s, b + s]);
             }
         }
     }
 
-    fn fin(&mut self, a: Vec3, b: Vec3, c: Vec3) {
-        let n = (b - a).cross(c - a).normalize_or_zero();
-        let start = self.verts.len() as u16;
-        for pos in [a, b, c] {
-            self.verts.push(ModelVert { pos, normal: n, mat: Mat::Fin });
-        }
-        self.indices.extend_from_slice(&[start, start + 1, start + 2]);
+    fn sphere(&mut self, center: Vec3, radius: f32, color: impl Fn(f32, Vec3) -> Color) {
+        self.capsule(center, 0.0, radius, color);
     }
 
-    fn eye(&mut self, center: Vec3, r: f32) {
-        let start = self.verts.len() as u16;
-        for d in OCTAHEDRON {
-            self.verts.push(ModelVert { pos: center + d * r, normal: d, mat: Mat::Eye });
+    fn cuboid(&mut self, center: Vec3, half: Vec3, color: Color) {
+        let faces = [
+            (Vec3::X, Vec3::Y, Vec3::Z),
+            (Vec3::NEG_X, Vec3::Y, Vec3::NEG_Z),
+            (Vec3::Y, Vec3::Z, Vec3::X),
+            (Vec3::NEG_Y, Vec3::X, Vec3::Z),
+            (Vec3::Z, Vec3::X, Vec3::Y),
+            (Vec3::NEG_Z, Vec3::Y, Vec3::X),
+        ];
+        for (n, u, v) in faces {
+            let start = self.verts.len() as u16;
+            for (su, sv) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let p = (n + u * su + v * sv) * half;
+                self.verts.push((center + p, n, color));
+            }
+            self.indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
         }
-        self.indices.extend(OCTAHEDRON_TRIS.iter().map(|&i| start + i));
+    }
+
+    fn draw(&self, batch: &mut Batch, sh: &Shading, pos: Vec3, rot: Quat, scale: Vec3) {
+        let base = batch.reserve(self.verts.len());
+        for &(p, n, c) in &self.verts {
+            let world = pos + rot * (p * scale);
+            let color = sh.shade(world, (rot * (n / scale)).normalize(), c);
+            batch.vertex(world, color);
+        }
+        batch.mesh.indices.extend(self.indices.iter().map(|&i| base + i));
     }
 }
 
-const OCTAHEDRON: [Vec3; 6] = [
-    Vec3::new(1.0, 0.0, 0.0),
-    Vec3::new(-1.0, 0.0, 0.0),
-    Vec3::new(0.0, 1.0, 0.0),
-    Vec3::new(0.0, -1.0, 0.0),
-    Vec3::new(0.0, 0.0, 1.0),
-    Vec3::new(0.0, 0.0, -1.0),
-];
-const OCTAHEDRON_TRIS: [u16; 24] = [0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4, 2, 0, 5, 1, 2, 5, 3, 1, 5, 0, 3, 5];
+fn solid(c: Color) -> impl Fn(f32, Vec3) -> Color {
+    move |_, _| c
+}
 
 pub struct Models {
-    fish: Model,
-    shark: Model,
-    jelly: Model,
+    trunk: Model,
+    thigh: Model,
+    shin: Model,
+    foot: Model,
+    arm: Model,
+    tree: Model,
+    rock: Model,
 }
 
 impl Models {
     pub fn new() -> Self {
-        let mut fish = Model::new();
-        fish.body(1.0, 0.42, 0.22, |t| {
-            let s = (1.0 - t * t).max(0.0).powf(0.45);
-            if t < 0.0 { s * (1.0 + t * 0.5) } else { s }
+        let mut trunk = Model::new();
+        let [hx, hy, hz] = TRUNK_HALF;
+        let waist = -hy + 0.18;
+        trunk.cuboid(vec3(0.0, (waist + hy) * 0.5, 0.0), vec3(hx, (hy - waist) * 0.5, hz), SHIRT);
+        trunk.cuboid(vec3(0.0, (waist - hy) * 0.5, 0.0), vec3(hx * 1.02, (waist + hy) * 0.5, hz * 1.02), SHORTS);
+        trunk.capsule(vec3(0.0, hy + 0.05, 0.0), 0.03, 0.05, solid(SKIN));
+        trunk.sphere(vec3(0.0, HEAD_OFFSET, 0.0), HEAD_RADIUS, |_, n| {
+            if n.y > 0.3 || n.x < -0.25 { HAIR } else { SKIN }
         });
-        fish.fin(vec3(-0.8, 0.0, 0.0), vec3(-1.5, 0.48, 0.0), vec3(-1.28, 0.0, 0.0));
-        fish.fin(vec3(-0.8, 0.0, 0.0), vec3(-1.28, 0.0, 0.0), vec3(-1.5, -0.48, 0.0));
-        fish.fin(vec3(0.25, 0.36, 0.0), vec3(-0.35, 0.3, 0.0), vec3(-0.2, 0.62, 0.0));
-        fish.fin(vec3(0.0, -0.3, 0.0), vec3(-0.3, -0.25, 0.0), vec3(-0.25, -0.45, 0.0));
         for side in [-1.0, 1.0] {
-            fish.eye(vec3(0.62, 0.1, 0.13 * side), 0.07);
+            trunk.sphere(vec3(HEAD_RADIUS * 0.88, HEAD_OFFSET + 0.02, 0.04 * side), 0.018, solid(EYE));
         }
 
-        let mut shark = Model::new();
-        shark.body(1.0, 0.3, 0.26, |t| {
-            let s = (1.0 - t * t).max(0.0).powf(0.55);
-            if t < 0.0 { s * (1.0 + t * 0.62) } else { s * (1.0 - t * t * 0.15) }
-        });
-        shark.fin(vec3(0.18, 0.27, 0.0), vec3(-0.3, 0.24, 0.0), vec3(-0.22, 0.78, 0.0));
-        shark.fin(vec3(-0.8, 0.02, 0.0), vec3(-1.55, 0.72, 0.0), vec3(-1.15, 0.0, 0.0));
-        shark.fin(vec3(-0.8, -0.02, 0.0), vec3(-1.15, 0.0, 0.0), vec3(-1.38, -0.42, 0.0));
-        shark.fin(vec3(-0.45, 0.16, 0.0), vec3(-0.6, 0.12, 0.0), vec3(-0.62, 0.3, 0.0));
-        for side in [-1.0, 1.0] {
-            shark.fin(
-                vec3(0.32, -0.12, 0.2 * side),
-                vec3(0.02, -0.15, 0.2 * side),
-                vec3(-0.15, -0.32, 0.8 * side),
-            );
-            shark.eye(vec3(0.72, 0.07, 0.15 * side), 0.045);
-        }
+        let mut thigh = Model::new();
+        thigh.capsule(Vec3::ZERO, THIGH_HALF_LEN, THIGH_RADIUS, |y, _| if y > -0.02 { SHORTS } else { SKIN });
 
-        let mut jelly = Model::new();
-        jelly.dome(1.0, 0.8);
+        let mut shin = Model::new();
+        shin.capsule(Vec3::ZERO, SHIN_HALF_LEN, SHIN_RADIUS, |y, _| if y < -0.12 { SOCK } else { SKIN });
 
-        Self { fish, shark, jelly }
+        let mut foot = Model::new();
+        let [fx, fy, fz] = FOOT_HALF;
+        foot.cuboid(vec3(0.0, 0.006, 0.0), vec3(fx, fy - 0.006, fz), SHOE);
+        foot.cuboid(vec3(0.0, -fy + 0.006, 0.0), vec3(fx * 1.02, 0.006, fz * 1.05), SOCK);
+
+        let mut arm = Model::new();
+        arm.capsule(Vec3::ZERO, ARM_HALF_LEN - 0.04, ARM_RADIUS, |y, _| if y > 0.1 { SHIRT } else { SKIN });
+        arm.sphere(vec3(0.0, -ARM_HALF_LEN + 0.01, 0.0), 0.05, solid(SKIN));
+
+        let mut tree = Model::new();
+        tree.capsule(vec3(0.0, 1.5, 0.0), 1.5, 0.18, solid(Color::new(0.4, 0.28, 0.18, 1.0)));
+        let leaves = Color::new(0.22, 0.5, 0.2, 1.0);
+        tree.sphere(vec3(0.0, 3.8, 0.0), 1.6, solid(leaves));
+        tree.sphere(vec3(0.7, 3.2, 0.5), 1.1, solid(Color::new(0.25, 0.55, 0.22, 1.0)));
+        tree.sphere(vec3(-0.6, 3.4, -0.6), 1.2, solid(Color::new(0.2, 0.45, 0.18, 1.0)));
+
+        let mut rock = Model::new();
+        rock.sphere(Vec3::ZERO, 1.0, solid(Color::new(0.52, 0.5, 0.47, 1.0)));
+
+        Self { trunk, thigh, shin, foot, arm, tree, rock }
     }
 }
 
-/// Orthonormal frame (forward, up, right) facing `dir`.
-fn basis(dir: Vec3) -> (Vec3, Vec3, Vec3) {
-    let f = if dir.length_squared() > 1e-6 { dir.normalize() } else { Vec3::X };
-    let mut r = f.cross(Vec3::Y);
-    if r.length_squared() < 1e-4 {
-        r = f.cross(Vec3::Z);
-    }
-    let r = r.normalize();
-    let u = r.cross(f);
-    (f, u, r)
+fn quat(rot: [f32; 4]) -> Quat {
+    Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3])
 }
 
-fn draw_model(
-    batch: &mut Batch,
-    sh: &Shading,
-    model: &Model,
-    origin: Vec3,
-    frame: (Vec3, Vec3, Vec3),
-    scale: f32,
-    color: Color,
-    deform: impl Fn(Vec3) -> Vec3,
-) {
-    let (f, u, r) = frame;
-    let base = batch.reserve(model.verts.len());
-    let belly = Color::new(
-        color.r + (1.0 - color.r) * 0.45,
-        color.g + (1.0 - color.g) * 0.45,
-        color.b + (1.0 - color.b) * 0.45,
-        color.a,
-    );
-    let fin = Color::new(color.r * 0.8, color.g * 0.8, color.b * 0.85, color.a * 0.9);
-    let eye = Color::new(0.03, 0.03, 0.05, 1.0);
-    for v in &model.verts {
-        let lp = deform(v.pos);
-        let world = origin + (f * lp.x + u * lp.y + r * lp.z) * scale;
-        let n = f * v.normal.x + u * v.normal.y + r * v.normal.z;
-        let (base_color, two_sided) = match v.mat {
-            Mat::Body => (color, false),
-            Mat::Belly => (belly, false),
-            Mat::Fin => (fin, true),
-            Mat::Eye => (eye, false),
+pub fn draw_person(batch: &mut Batch, sh: &Shading, models: &Models, parts: &[PartPose]) {
+    for p in parts {
+        let model = match p.kind {
+            PartKind::Trunk => &models.trunk,
+            PartKind::Thigh => &models.thigh,
+            PartKind::Shin => &models.shin,
+            PartKind::Foot => &models.foot,
+            PartKind::Arm => &models.arm,
         };
-        let c = sh.shade(world, n, base_color, two_sided);
-        batch.vertex(world, c);
-    }
-    batch.mesh.indices.extend(model.indices.iter().map(|&i| base + i));
-}
-
-pub fn draw_creature(batch: &mut Batch, sh: &Shading, models: &Models, c: &Creature) {
-    let p = c.species.params();
-    let color = c.color();
-    let phase = c.phase;
-    match c.species {
-        Species::Fish | Species::Shark => {
-            let model = if c.species == Species::Fish { &models.fish } else { &models.shark };
-            let amp = if c.species == Species::Fish { 0.22 } else { 0.14 };
-            draw_model(batch, sh, model, c.pos, basis(c.heading), p.size, color, |v| {
-                if v.x < 0.3 {
-                    let k = 0.3 - v.x;
-                    vec3(v.x, v.y, v.z + (phase - v.x * 2.5).sin() * amp * k)
-                } else {
-                    v
-                }
-            });
-        }
-        Species::Jellyfish => {}
+        model.draw(batch, sh, Vec3::from(p.pos), quat(p.rot), Vec3::ONE);
     }
 }
 
-/// Jellyfish are translucent, so they are drawn in a later pass.
-pub fn draw_jellyfish(batch: &mut Batch, sh: &Shading, models: &Models, c: &Creature, time: f32) {
-    let p = c.species.params();
-    let color = c.color();
-    let pulse = c.phase.sin();
-    // The bell leads, so its axis tilts toward the swimming direction.
-    let axis = (Vec3::Y * 1.5 + c.heading).normalize();
-    let (f, u, r) = basis(axis);
-    // basis() returns forward = axis; remap so the model's +y follows the axis.
-    let frame = (u, f, r);
-    draw_model(batch, sh, &models.jelly, c.pos, frame, p.size, color, |v| {
-        vec3(v.x * (1.0 + 0.13 * pulse), v.y * (1.0 - 0.15 * pulse), v.z * (1.0 + 0.13 * pulse))
-    });
-
-    // Tentacles trail behind the bell as wavy ribbons.
-    let rim = p.size * 0.85;
-    let tentacle_color = Color::new(color.r, color.g, color.b, 0.55);
-    let down = -axis;
-    for k in 0..8 {
-        let a = k as f32 / 8.0 * std::f32::consts::TAU;
-        let mut prev = c.pos + (u * a.cos() + r * a.sin()) * rim - axis * 0.1 * p.size;
-        for s in 1..=7 {
-            let sf = s as f32;
-            let sway = (time * 1.7 + sf * 0.6 + k as f32).sin() * 0.12 * sf;
-            let next = prev + down * 0.45 * p.size + (u * a.cos() + r * a.sin()) * sway * 0.15
-                - c.vel * 0.02 * sf;
-            let w = 0.06 * p.size * (1.0 - sf / 9.0);
-            let side = r * w;
-            batch.quad(sh, [prev - side, prev + side, next + side, next - side], tentacle_color);
-            prev = next;
-        }
+/// Soft dark blobs under each body part; they shrink and fade with height.
+pub fn draw_shadows(batch: &mut Batch, parts: &[PartPose]) {
+    for p in parts {
+        let pos = Vec3::from(p.pos);
+        let size = match p.kind {
+            PartKind::Trunk => 0.3,
+            PartKind::Thigh => 0.12,
+            PartKind::Shin => 0.09,
+            PartKind::Foot => 0.15,
+            PartKind::Arm => 0.08,
+        };
+        let fade = (1.0 - pos.y / 2.5).clamp(0.0, 1.0);
+        batch.disc(vec3(pos.x - pos.y * 0.25, 0.012, pos.z + pos.y * 0.2), size * 1.3, size, Color::new(0.0, 0.0, 0.0, 0.35 * fade));
     }
 }
 
-pub fn draw_plankton(batch: &mut Batch, sh: &Shading, world: &World, time: f32) {
-    for (i, p) in world.plankton.iter().enumerate() {
-        let twinkle = 0.75 + 0.25 * (time * 3.0 + i as f32).sin();
-        let color = Color::new(0.35 * twinkle, 0.95 * twinkle, 0.45 * twinkle, 1.0);
-        let base = batch.reserve(6);
-        let r = 0.16;
-        for d in OCTAHEDRON {
-            let pos = p.pos + d * r;
-            // Plankton glows faintly, so it is only fogged, not shaded.
-            batch.vertex(pos, sh.fog(pos, color));
-        }
-        batch.mesh.indices.extend(OCTAHEDRON_TRIS.iter().map(|&i| base + i));
-    }
-}
-
-/// Static and ambient decoration: sand, rocks, seaweed, bubbles, surface.
+/// The field: grass, a running track with distance lines, trees and rocks.
 pub struct Scenery {
-    ground: StaticMesh,
-    seaweed: Vec<(Vec3, f32, f32, Color)>,
-    bubbles: Vec<Vec3>,
-    vents: Vec<Vec3>,
-}
-
-struct StaticMesh {
-    verts: Vec<(Vec3, Vec3, Color)>,
-    indices: Vec<u32>,
-}
-
-pub fn floor_height(x: f32, z: f32) -> f32 {
-    -0.3 + 0.45 * (x * 0.21).sin() * (z * 0.17).cos() + 0.25 * (x * 0.07 + z * 0.13).sin()
+    trees: Vec<(Vec3, f32, f32)>,
+    rocks: Vec<(Vec3, Vec3)>,
 }
 
 impl Scenery {
     pub fn new() -> Self {
-        let mut ground = StaticMesh { verts: Vec::new(), indices: Vec::new() };
-
-        // Sandy floor.
-        let (nx, nz) = (60, 40);
-        for iz in 0..=nz {
-            for ix in 0..=nx {
-                let x = TANK_MIN.x + (TANK_MAX.x - TANK_MIN.x) * ix as f32 / nx as f32;
-                let z = TANK_MIN.z + (TANK_MAX.z - TANK_MIN.z) * iz as f32 / nz as f32;
-                let y = floor_height(x, z);
-                let e = 0.05;
-                let n = vec3(
-                    floor_height(x - e, z) - floor_height(x + e, z),
-                    2.0 * e,
-                    floor_height(x, z - e) - floor_height(x, z + e),
-                )
-                .normalize();
-                let speck = gen_range(-0.04, 0.04);
-                ground.verts.push((vec3(x, y, z), n, Color::new(0.76 + speck, 0.68 + speck, 0.5 + speck, 1.0)));
-            }
-        }
-        for iz in 0..nz {
-            for ix in 0..nx {
-                let a = (iz * (nx + 1) + ix) as u32;
-                let b = a + 1;
-                let c = a + nx as u32 + 1;
-                let d = c + 1;
-                ground.indices.extend_from_slice(&[a, c, b, b, c, d]);
-            }
-        }
-
-        // Rocks: lumpy squashed spheres.
-        for _ in 0..9 {
-            let center = vec3(
-                gen_range(TANK_MIN.x + 3.0, TANK_MAX.x - 3.0),
-                0.0,
-                gen_range(TANK_MIN.z + 3.0, TANK_MAX.z - 3.0),
-            );
-            let center = vec3(center.x, floor_height(center.x, center.z), center.z);
-            let radii = vec3(gen_range(1.2, 3.2), gen_range(0.8, 2.2), gen_range(1.2, 3.0));
-            let g = gen_range(0.3, 0.45);
-            let color = Color::new(g, g * 0.95, g * 0.9, 1.0);
-            let seed = gen_range(0.0, 100.0);
-            let start = ground.verts.len() as u32;
-            let (rings, slices) = (8, 12);
-            for i in 0..=rings {
-                let theta = i as f32 / rings as f32 * std::f32::consts::PI;
-                for j in 0..slices {
-                    let a = j as f32 / slices as f32 * std::f32::consts::TAU;
-                    let dir = vec3(theta.sin() * a.cos(), theta.cos(), theta.sin() * a.sin());
-                    let lump = 1.0 + 0.18 * (dir.x * 3.1 + seed).sin() * (dir.z * 2.7 + seed).cos();
-                    ground.verts.push((center + dir * radii * lump, dir, color));
-                }
-            }
-            for i in 0..rings {
-                for j in 0..slices {
-                    let a = start + (i * slices + j) as u32;
-                    let b = start + (i * slices + (j + 1) % slices) as u32;
-                    ground.indices.extend_from_slice(&[a, b, a + slices as u32, b, b + slices as u32, a + slices as u32]);
-                }
-            }
-        }
-
-        let seaweed = (0..34)
+        let side = || if gen_range(0, 2) == 0 { -1.0 } else { 1.0 };
+        let trees = (0..260)
             .map(|_| {
-                let x = gen_range(TANK_MIN.x + 1.0, TANK_MAX.x - 1.0);
-                let z = gen_range(TANK_MIN.z + 1.0, TANK_MAX.z - 1.0);
-                let g = gen_range(0.45, 0.75);
-                (
-                    vec3(x, floor_height(x, z), z),
-                    gen_range(4.0, 11.0),
-                    gen_range(0.0, 10.0),
-                    Color::new(0.15, g, 0.25, 1.0),
-                )
+                let pos = vec3(gen_range(-80.0, 700.0), 0.0, side() * gen_range(6.0, 45.0));
+                (pos, gen_range(0.8, 1.5), gen_range(0.0, std::f32::consts::TAU))
             })
             .collect();
-
-        let vents = (0..3)
+        let rocks = (0..120)
             .map(|_| {
-                let x = gen_range(TANK_MIN.x + 4.0, TANK_MAX.x - 4.0);
-                let z = gen_range(TANK_MIN.z + 4.0, TANK_MAX.z - 4.0);
-                vec3(x, floor_height(x, z), z)
+                let pos = vec3(gen_range(-80.0, 700.0), 0.0, side() * gen_range(2.5, 30.0));
+                let r = gen_range(0.2, 0.8);
+                (pos, vec3(r * gen_range(1.0, 1.6), r * gen_range(0.4, 0.8), r))
             })
             .collect();
-
-        Self { ground, seaweed, bubbles: Vec::new(), vents }
+        Self { trees, rocks }
     }
 
-    pub fn update(&mut self, dt: f32) {
-        for v in &self.vents {
-            if gen_range(0.0, 1.0) < dt * 6.0 {
-                self.bubbles.push(*v + vec3(gen_range(-0.3, 0.3), 0.0, gen_range(-0.3, 0.3)));
-            }
-        }
-        for b in &mut self.bubbles {
-            b.y += dt * 3.0;
-            b.x += (b.y * 1.3).sin() * dt * 0.4;
-        }
-        self.bubbles.retain(|b| b.y < TANK_MAX.y);
-    }
-
-    pub fn draw_opaque(&self, batch: &mut Batch, sh: &Shading, time: f32) {
-        // Ground can exceed one batch, so submit it in chunks of whole triangles.
-        let mut tri = 0;
-        let idx = &self.ground.indices;
-        while tri < idx.len() {
-            let end = (tri + 6000).min(idx.len());
-            let base = batch.reserve(end - tri);
-            for &i in &idx[tri..end] {
-                let (pos, n, color) = self.ground.verts[i as usize];
-                batch.vertex(pos, sh.shade(pos, n, color, false));
-            }
-            batch.mesh.indices.extend((0..(end - tri) as u16).map(|i| base + i));
-            tri = end;
-        }
-
-        // Swaying seaweed ribbons.
-        for &(root, height, seed, color) in &self.seaweed {
-            let segs = 10;
-            let mut prev = root;
-            for s in 1..=segs {
-                let t = s as f32 / segs as f32;
-                let sway = (time * 0.9 + seed + t * 2.5).sin() * 0.9 * t;
-                let next = root + vec3(sway, height * t, (time * 0.7 + seed * 1.3 + t * 2.0).cos() * 0.5 * t);
-                let w0 = 0.32 * (1.0 - (t - 1.0 / segs as f32) * 0.8);
-                let w1 = 0.32 * (1.0 - t * 0.8);
-                let side = vec3(0.4, 0.0, 1.0).normalize();
-                batch.quad(sh, [prev - side * w0, prev + side * w0, next + side * w1, next - side * w1], color);
-                prev = next;
-            }
-        }
-    }
-
-    pub fn draw_translucent(&self, batch: &mut Batch, sh: &Shading, time: f32) {
-        let bubble = Color::new(0.8, 0.95, 1.0, 0.45);
-        for b in &self.bubbles {
-            let base = batch.reserve(6);
-            for d in OCTAHEDRON {
-                let pos = *b + d * 0.12;
-                batch.vertex(pos, sh.fog(pos, bubble));
-            }
-            batch.mesh.indices.extend(OCTAHEDRON_TRIS.iter().map(|&i| base + i));
-        }
-
-        // Rippling water surface.
-        let (nx, nz) = (30, 20);
-        let surf = Color::new(0.35, 0.65, 0.8, 0.35);
-        let h = |x: f32, z: f32| TANK_MAX.y + 0.2 * (x * 0.4 + time).sin() * (z * 0.35 - time * 0.8).cos();
-        for iz in 0..nz {
-            for ix in 0..nx {
-                let x0 = TANK_MIN.x + (TANK_MAX.x - TANK_MIN.x) * ix as f32 / nx as f32;
-                let x1 = TANK_MIN.x + (TANK_MAX.x - TANK_MIN.x) * (ix + 1) as f32 / nx as f32;
-                let z0 = TANK_MIN.z + (TANK_MAX.z - TANK_MIN.z) * iz as f32 / nz as f32;
-                let z1 = TANK_MIN.z + (TANK_MAX.z - TANK_MIN.z) * (iz + 1) as f32 / nz as f32;
+    /// Draws everything within view of the point `focus_x` along the track.
+    /// `record` is the best distance reached so far, marked on the track.
+    pub fn draw(&self, batch: &mut Batch, sh: &Shading, models: &Models, focus_x: f32, record: Option<f32>) {
+        // Grass in 2 m tiles with a gentle checker so motion is easy to see.
+        let tile = 2.0;
+        let x0 = ((focus_x - 60.0) / tile).floor() as i32;
+        let x1 = ((focus_x + 110.0) / tile).ceil() as i32;
+        for ix in x0..x1 {
+            for iz in -30..30 {
+                let (x, z) = (ix as f32 * tile, iz as f32 * tile);
+                let hash = ((ix * 73 + iz * 151) & 7) as f32 / 7.0;
+                let checker = if (ix + iz) % 2 == 0 { 0.0 } else { 0.025 };
+                let g = Color::new(0.33 + checker + hash * 0.03, 0.58 + checker + hash * 0.05, 0.25 + hash * 0.02, 1.0);
                 batch.quad(
                     sh,
-                    [vec3(x0, h(x0, z0), z0), vec3(x1, h(x1, z0), z0), vec3(x1, h(x1, z1), z1), vec3(x0, h(x0, z1), z1)],
-                    surf,
+                    [vec3(x, 0.0, z), vec3(x + tile, 0.0, z), vec3(x + tile, 0.0, z + tile), vec3(x, 0.0, z + tile)],
+                    g,
                 );
             }
         }
 
-        // Faint shafts of sunlight.
-        for k in 0..7 {
-            let kf = k as f32;
-            let x = TANK_MIN.x + 6.0 + kf * 8.0 + (time * 0.1 + kf).sin() * 2.0;
-            let z = -10.0 + (kf * 2.3).sin() * 8.0;
-            let top = vec3(x, TANK_MAX.y, z);
-            let bottom = top + vec3(-6.0, -TANK_MAX.y, 2.0);
-            let alpha = 0.035 + 0.02 * (time * 0.5 + kf * 1.7).sin();
-            let c = Color::new(0.7, 0.9, 1.0, alpha);
-            let w = vec3(1.6, 0.0, 0.0);
-            let base = batch.reserve(4);
-            for v in [top - w, top + w, bottom + w * 1.8, bottom - w * 1.8] {
-                batch.vertex(v, c);
+        // Running track along +x.
+        let (tx0, tx1) = (focus_x - 60.0, focus_x + 110.0);
+        let lane = 1.1;
+        let y = 0.004;
+        let track = Color::new(0.72, 0.36, 0.26, 1.0);
+        let white = Color::new(0.95, 0.95, 0.92, 1.0);
+        let mut seg = tx0;
+        while seg < tx1 {
+            let e = (seg + 10.0).min(tx1);
+            batch.quad(sh, [vec3(seg, y, -lane), vec3(e, y, -lane), vec3(e, y, lane), vec3(seg, y, lane)], track);
+            for zl in [-lane, lane] {
+                batch.quad(sh, [vec3(seg, y * 2.0, zl - 0.04), vec3(e, y * 2.0, zl - 0.04), vec3(e, y * 2.0, zl + 0.04), vec3(seg, y * 2.0, zl + 0.04)], white);
             }
-            batch.mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            seg = e;
+        }
+        let first = tx0.ceil().max(0.0) as i32;
+        for m in first..tx1 as i32 {
+            let x = m as f32;
+            let w = if m == 0 { 0.12 } else if m % 5 == 0 { 0.06 } else { 0.015 };
+            let reach = if m % 5 == 0 { lane } else { 0.25 };
+            batch.quad(sh, [vec3(x - w, y * 2.0, -reach), vec3(x + w, y * 2.0, -reach), vec3(x + w, y * 2.0, reach), vec3(x - w, y * 2.0, reach)], white);
+            if m % 5 == 0 {
+                // Distance post beside the track.
+                let post = vec3(x, 0.0, -lane - 0.4);
+                batch.quad(sh, [post + vec3(-0.04, 0.0, 0.0), post + vec3(0.04, 0.0, 0.0), post + vec3(0.04, 0.9, 0.0), post + vec3(-0.04, 0.9, 0.0)], white);
+                batch.quad(sh, [post + vec3(-0.25, 0.9, 0.0), post + vec3(0.25, 0.9, 0.0), post + vec3(0.25, 1.2, 0.0), post + vec3(-0.25, 1.2, 0.0)], white);
+            }
+        }
+
+        // The current record, as a gold line and flag.
+        if let Some(r) = record {
+            let gold = Color::new(1.0, 0.8, 0.15, 1.0);
+            batch.quad(sh, [vec3(r - 0.05, y * 3.0, -lane), vec3(r + 0.05, y * 3.0, -lane), vec3(r + 0.05, y * 3.0, lane), vec3(r - 0.05, y * 3.0, lane)], gold);
+            let pole = vec3(r, 0.0, lane + 0.3);
+            batch.quad(sh, [pole + vec3(-0.025, 0.0, 0.0), pole + vec3(0.025, 0.0, 0.0), pole + vec3(0.025, 1.8, 0.0), pole + vec3(-0.025, 1.8, 0.0)], white);
+            batch.quad(sh, [pole + vec3(0.0, 1.8, 0.0), pole + vec3(0.6, 1.65, 0.0), pole + vec3(0.6, 1.4, 0.0), pole + vec3(0.0, 1.35, 0.0)], gold);
+        }
+
+        for &(pos, scale, spin) in &self.trees {
+            if pos.x > tx0 && pos.x < tx1 {
+                let s = Vec3::splat(scale);
+                models.tree.draw(batch, sh, pos, Quat::from_rotation_y(spin), s);
+            }
+        }
+        for &(pos, size) in &self.rocks {
+            if pos.x > tx0 && pos.x < tx1 {
+                models.rock.draw(batch, sh, pos, Quat::IDENTITY, size);
+            }
         }
     }
 }
 
-pub fn draw_tank_frame() {
-    let (a, b) = (TANK_MIN, TANK_MAX);
-    let c = Color::new(0.6, 0.85, 1.0, 0.25);
-    let corners = [
-        vec3(a.x, a.y, a.z),
-        vec3(b.x, a.y, a.z),
-        vec3(b.x, a.y, b.z),
-        vec3(a.x, a.y, b.z),
-        vec3(a.x, b.y, a.z),
-        vec3(b.x, b.y, a.z),
-        vec3(b.x, b.y, b.z),
-        vec3(a.x, b.y, b.z),
-    ];
-    for i in 0..4 {
-        draw_line_3d(corners[i], corners[(i + 1) % 4], c);
-        draw_line_3d(corners[i + 4], corners[(i + 1) % 4 + 4], c);
-        draw_line_3d(corners[i], corners[i + 4], c);
-    }
+/// Vertical sky gradient, drawn in screen space before the 3D scene.
+pub fn draw_sky() {
+    let (w, h) = (screen_width(), screen_height());
+    let v = |x: f32, y: f32, c: Color| Vertex::new(x, y, 0.0, 0.0, 0.0, c);
+    let mesh = Mesh {
+        vertices: vec![v(0.0, 0.0, SKY_TOP), v(w, 0.0, SKY_TOP), v(w, h * 0.55, HORIZON), v(0.0, h * 0.55, HORIZON)],
+        indices: vec![0, 1, 2, 0, 2, 3],
+        texture: None,
+    };
+    draw_mesh(&mesh);
 }

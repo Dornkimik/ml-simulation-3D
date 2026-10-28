@@ -2,10 +2,11 @@
 name = "ml_simulation_3d"
 version = "0.1.0"
 edition = "2021"
-description = "3D underwater ecosystem where neural-network creatures evolve by natural selection"
+description = "A 3D physics-simulated person that learns to walk with neural networks and evolution strategies"
 
 [dependencies]
 macroquad = "0.4"
+rapier3d = "0.36.1"
 
 # Keep debug builds playable: optimize dependencies fully and our own code a bit.
 [profile.dev]

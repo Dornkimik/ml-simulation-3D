@@ -1,20 +1,22 @@
-//! A small feed-forward neural network used as each creature's brain.
+//! A small feed-forward neural network that drives one side of the walker's
+//! body. The same network runs for the left and the right side (with mirrored
+//! inputs and half a gait cycle apart), so gaits come out symmetric.
 //!
-//! Brains are never trained with gradients. They improve through
-//! neuroevolution: creatures that eat and survive long enough reproduce,
-//! passing on a mutated copy of their weights.
+//! The weights are found by evolution strategies (see trainer.rs), not by
+//! backpropagation.
 
 use macroquad::rand::gen_range;
 
 /// Names of the sensor inputs, shown in the brain viewer.
-pub const INPUT_LABELS: [&str; 19] = [
-    "food x", "food y", "food z", "threat x", "threat y", "threat z", "kin x", "kin y", "kin z",
-    "vel x", "vel y", "vel z", "pos x", "pos y", "pos z", "energy", "clock", "memory", "bias",
+pub const INPUT_LABELS: [&str; 18] = [
+    "phase sin", "phase cos", "lean fwd", "lean side", "lean fwd v", "lean side v", "height",
+    "speed fwd", "speed side", "hip", "hip out", "knee", "ankle", "other hip", "other knee",
+    "foot down", "other foot", "bias",
 ];
-pub const OUTPUT_LABELS: [&str; 5] = ["thrust x", "thrust y", "thrust z", "throttle", "memory"];
+pub const OUTPUT_LABELS: [&str; 5] = ["hip", "hip out", "knee", "ankle", "shoulder"];
 
 pub const INPUTS: usize = INPUT_LABELS.len();
-pub const HIDDEN: usize = 14;
+pub const HIDDEN: usize = 16;
 pub const OUTPUTS: usize = OUTPUT_LABELS.len();
 
 /// A fully connected layer. Weights are stored row-major, one row per
@@ -27,9 +29,9 @@ pub struct Layer {
 }
 
 impl Layer {
-    fn random(inputs: usize, outputs: usize) -> Self {
+    fn random(inputs: usize, outputs: usize, gain: f32) -> Self {
         // Scaled init keeps tanh units out of saturation at the start.
-        let scale = 1.0 / (inputs as f32).sqrt() * 1.5;
+        let scale = gain / (inputs as f32).sqrt();
         let weights = (0..outputs * (inputs + 1))
             .map(|_| gen_range(-1.0, 1.0) * scale)
             .collect();
@@ -63,9 +65,32 @@ pub struct Brain {
 }
 
 impl Brain {
+    /// A random brain with small output weights, so it starts out holding
+    /// roughly the default standing pose instead of flailing.
     pub fn random() -> Self {
-        let layers = vec![Layer::random(INPUTS, HIDDEN), Layer::random(HIDDEN, OUTPUTS)];
+        let layers = vec![Layer::random(INPUTS, HIDDEN, 1.5), Layer::random(HIDDEN, OUTPUTS, 0.4)];
         Self::from_layers(layers)
+    }
+
+    pub fn weights(&self) -> impl Iterator<Item = f32> + '_ {
+        self.layers.iter().flat_map(|l| l.weights.iter().copied())
+    }
+
+    /// Rebuilds a brain from `weights()` output, or None if the size doesn't
+    /// match the current network shape.
+    pub fn from_weights(weights: &[f32]) -> Option<Self> {
+        let mut layers = vec![Layer::random(INPUTS, HIDDEN, 1.0), Layer::random(HIDDEN, OUTPUTS, 1.0)];
+        let total: usize = layers.iter().map(|l| l.weights.len()).sum();
+        if weights.len() != total {
+            return None;
+        }
+        let mut rest = weights;
+        for l in &mut layers {
+            let (head, tail) = rest.split_at(l.weights.len());
+            l.weights.copy_from_slice(head);
+            rest = tail;
+        }
+        Some(Self::from_layers(layers))
     }
 
     fn from_layers(layers: Vec<Layer>) -> Self {
@@ -84,45 +109,6 @@ impl Brain {
         let mut out = [0.0; OUTPUTS];
         out.copy_from_slice(self.activations.last().unwrap());
         out
-    }
-
-    /// Returns a copy with gaussian noise added to a fraction of the weights,
-    /// plus the occasional weight replaced outright.
-    pub fn mutated(&self, rate: f32, strength: f32) -> Self {
-        let mut child = self.clone();
-        for layer in &mut child.layers {
-            for w in &mut layer.weights {
-                let roll = gen_range(0.0, 1.0);
-                if roll < rate * 0.1 {
-                    *w = gen_range(-1.5, 1.5);
-                } else if roll < rate {
-                    *w = (*w + gaussian() * strength).clamp(-4.0, 4.0);
-                }
-            }
-        }
-        child
-    }
-
-    /// Uniform crossover per neuron, so each neuron's incoming weights stay
-    /// together as a functional unit.
-    pub fn crossover(a: &Brain, b: &Brain) -> Self {
-        let layers = a
-            .layers
-            .iter()
-            .zip(&b.layers)
-            .map(|(la, lb)| {
-                let stride = la.inputs + 1;
-                let mut weights = la.weights.clone();
-                for o in 0..la.outputs {
-                    if gen_range(0, 2) == 1 {
-                        let r = o * stride..(o + 1) * stride;
-                        weights[r.clone()].copy_from_slice(&lb.weights[r]);
-                    }
-                }
-                Layer { inputs: la.inputs, outputs: la.outputs, weights }
-            })
-            .collect();
-        Self::from_layers(layers)
     }
 }
 
