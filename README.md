@@ -50,7 +50,8 @@ An attempt ends early if the person falls (torso too low or tilted, or head too 
 |---|---|
 | Left-drag / wheel | Orbit / zoom the camera (it follows the person) |
 | N | Restart the attempt now with the latest champion |
-| Space / + / - | Pause the view / change view speed (0.25x to 8x) |
+| Space | Pause the view |
+| + / - or Up / Down | Change view speed (0.25x to 8x) |
 | P | Pause or resume training |
 | R | Forget all training (deletes `walker_brain.txt`) and start over |
 | B / G / H | Toggle the live brain view / learning-curve graph / help |

@@ -108,10 +108,20 @@ async fn main() {
         if is_key_pressed(KeyCode::Space) {
             state.paused = !state.paused;
         }
-        if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd) || is_key_pressed(KeyCode::Up) {
+        // Read +/- as typed characters so they work on any keyboard layout
+        // (on a German keyboard, for example, + is not where KeyCode::Equal is).
+        let (mut faster, mut slower) = (is_key_pressed(KeyCode::Up), is_key_pressed(KeyCode::Down));
+        while let Some(c) = get_char_pressed() {
+            match c {
+                '+' | '=' => faster = true,
+                '-' | '_' => slower = true,
+                _ => {}
+            }
+        }
+        if faster {
             speed_idx = (speed_idx + 1).min(SPEEDS.len() - 1);
         }
-        if is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract) || is_key_pressed(KeyCode::Down) {
+        if slower {
             speed_idx = speed_idx.saturating_sub(1);
         }
         state.speed = SPEEDS[speed_idx];

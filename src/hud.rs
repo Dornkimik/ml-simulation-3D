@@ -201,7 +201,7 @@ fn draw_help(state: &HudState) {
         &[
             "drag: orbit camera   wheel: zoom",
             "N: replay with the latest champion",
-            "Space: pause view   +/-: view speed",
+            "Space: pause view   +/- or Up/Down: speed",
             "P: pause training   R: forget & restart",
             "B: brain   G: graph   H: hide help",
         ]
