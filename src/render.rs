@@ -1,27 +1,50 @@
-//! 3D rendering of the field and the person. Macroquad has no built-in
-//! lighting, so meshes are lit and fogged per vertex on the CPU and submitted
-//! in large batches.
+//! 3D rendering of the pitch, the players and the ball. Macroquad has no
+//! built-in lighting, so meshes are lit and fogged per vertex on the CPU and
+//! submitted in large batches.
 
 use macroquad::models::{Mesh, Vertex};
 use macroquad::prelude::*;
 use macroquad::rand::gen_range;
 
-use crate::walker::{
+use crate::pose::{
     PartKind, PartPose, ARM_HALF_LEN, ARM_RADIUS, FOOT_HALF, HEAD_OFFSET, HEAD_RADIUS, SHIN_HALF_LEN, SHIN_RADIUS,
     THIGH_HALF_LEN, THIGH_RADIUS, TRUNK_HALF,
 };
+use crate::soccer::{BALL_RADIUS, GOAL_DEPTH, GOAL_HALF_WIDTH, GOAL_HEIGHT, HALF_LENGTH, HALF_WIDTH};
 
 pub const SKY_TOP: Color = Color::new(0.33, 0.56, 0.86, 1.0);
 pub const HORIZON: Color = Color::new(0.78, 0.86, 0.93, 1.0);
 const BATCH_VERTS: usize = 30_000;
+/// Must stay below the window's draw_call_index_capacity.
+const BATCH_INDICES: usize = 150_000;
 
 const SKIN: Color = Color::new(0.93, 0.74, 0.6, 1.0);
-const SHIRT: Color = Color::new(0.2, 0.5, 0.85, 1.0);
-const SHORTS: Color = Color::new(0.16, 0.18, 0.27, 1.0);
-const SHOE: Color = Color::new(0.85, 0.27, 0.2, 1.0);
-const SOCK: Color = Color::new(0.95, 0.95, 0.95, 1.0);
-const HAIR: Color = Color::new(0.27, 0.17, 0.1, 1.0);
+const BOOT: Color = Color::new(0.12, 0.12, 0.14, 1.0);
 const EYE: Color = Color::new(0.05, 0.05, 0.07, 1.0);
+const WHITE: Color = Color::new(0.95, 0.95, 0.92, 1.0);
+
+/// Team colors of one player.
+struct Kit {
+    shirt: Color,
+    shorts: Color,
+    socks: Color,
+    hair: Color,
+}
+
+const KITS: [Kit; 2] = [
+    Kit {
+        shirt: Color::new(0.2, 0.45, 0.9, 1.0),
+        shorts: Color::new(0.95, 0.95, 0.95, 1.0),
+        socks: Color::new(0.2, 0.45, 0.9, 1.0),
+        hair: Color::new(0.27, 0.17, 0.1, 1.0),
+    },
+    Kit {
+        shirt: Color::new(0.88, 0.2, 0.18, 1.0),
+        shorts: Color::new(0.14, 0.14, 0.18, 1.0),
+        socks: Color::new(0.95, 0.95, 0.95, 1.0),
+        hair: Color::new(0.85, 0.68, 0.35, 1.0),
+    },
+];
 
 /// Per-frame lighting context.
 pub struct Shading {
@@ -45,7 +68,7 @@ impl Shading {
     /// Distant things fade into the hazy horizon.
     fn fog(&self, pos: Vec3, c: Color) -> Color {
         let dist = pos.distance(self.cam_pos);
-        let f = 1.0 - (-(dist - 25.0).max(0.0) * 0.011).exp();
+        let f = 1.0 - (-(dist - 45.0).max(0.0) * 0.011).exp();
         Color::new(
             c.r + (HORIZON.r - c.r) * f,
             c.g + (HORIZON.g - c.g) * f,
@@ -65,8 +88,8 @@ impl Batch {
         Self { mesh: Mesh { vertices: Vec::with_capacity(BATCH_VERTS), indices: Vec::new(), texture: None } }
     }
 
-    fn reserve(&mut self, verts: usize) -> u16 {
-        if self.mesh.vertices.len() + verts > BATCH_VERTS {
+    fn reserve(&mut self, verts: usize, indices: usize) -> u16 {
+        if self.mesh.vertices.len() + verts > BATCH_VERTS || self.mesh.indices.len() + indices > BATCH_INDICES {
             self.flush();
         }
         self.mesh.vertices.len() as u16
@@ -84,11 +107,9 @@ impl Batch {
         }
     }
 
-    /// A flat quad, lit with its own face normal.
-    fn quad(&mut self, sh: &Shading, p: [Vec3; 4], color: Color) {
-        let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
-        let n = if n.y < 0.0 { -n } else { n };
-        let base = self.reserve(4);
+    /// A flat quad, lit with the given normal.
+    fn quad_lit(&mut self, sh: &Shading, p: [Vec3; 4], n: Vec3, color: Color) {
+        let base = self.reserve(4, 6);
         for v in p {
             let c = sh.shade(v, n, color);
             self.vertex(v, c);
@@ -96,10 +117,31 @@ impl Batch {
         self.mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
+    /// A flat quad, lit with its own face normal (turned upward).
+    fn quad(&mut self, sh: &Shading, p: [Vec3; 4], color: Color) {
+        let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+        self.quad_lit(sh, p, if n.y < 0.0 { -n } else { n }, color);
+    }
+
+    /// A flat strip on the ground from `a` to `b`, `width` wide.
+    fn ground_line(&mut self, sh: &Shading, a: Vec2, b: Vec2, width: f32, y: f32, color: Color) {
+        let side = (b - a).perp().normalize_or_zero() * (width * 0.5);
+        let p = |v: Vec2| vec3(v.x, y, v.y);
+        self.quad_lit(sh, [p(a - side), p(b - side), p(b + side), p(a + side)], Vec3::Y, color);
+    }
+
+    /// An axis-aligned box.
+    fn cuboid(&mut self, sh: &Shading, center: Vec3, half: Vec3, color: Color) {
+        for (n, u, v) in CUBE_FACES {
+            let corner = |su: f32, sv: f32| center + (n + u * su + v * sv) * half;
+            self.quad_lit(sh, [corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)], n, color);
+        }
+    }
+
     /// A flat disc on the ground, for blob shadows. Not lit or fogged.
     fn disc(&mut self, center: Vec3, rx: f32, rz: f32, color: Color) {
         let n = 16;
-        let base = self.reserve(n + 1);
+        let base = self.reserve(n + 1, 3 * n);
         self.vertex(center, color);
         let rim = Color::new(color.r, color.g, color.b, 0.0);
         for i in 0..n {
@@ -111,6 +153,16 @@ impl Batch {
         }
     }
 }
+
+/// Faces of a cube as (normal, u, v) axes.
+const CUBE_FACES: [(Vec3, Vec3, Vec3); 6] = [
+    (Vec3::X, Vec3::Y, Vec3::Z),
+    (Vec3::NEG_X, Vec3::Y, Vec3::NEG_Z),
+    (Vec3::Y, Vec3::Z, Vec3::X),
+    (Vec3::NEG_Y, Vec3::X, Vec3::Z),
+    (Vec3::Z, Vec3::X, Vec3::Y),
+    (Vec3::NEG_Z, Vec3::Y, Vec3::X),
+];
 
 /// A mesh in local space with per-vertex colors and normals.
 pub struct Model {
@@ -157,15 +209,7 @@ impl Model {
     }
 
     fn cuboid(&mut self, center: Vec3, half: Vec3, color: Color) {
-        let faces = [
-            (Vec3::X, Vec3::Y, Vec3::Z),
-            (Vec3::NEG_X, Vec3::Y, Vec3::NEG_Z),
-            (Vec3::Y, Vec3::Z, Vec3::X),
-            (Vec3::NEG_Y, Vec3::X, Vec3::Z),
-            (Vec3::Z, Vec3::X, Vec3::Y),
-            (Vec3::NEG_Z, Vec3::Y, Vec3::X),
-        ];
-        for (n, u, v) in faces {
+        for (n, u, v) in CUBE_FACES {
             let start = self.verts.len() as u16;
             for (su, sv) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
                 let p = (n + u * su + v * sv) * half;
@@ -176,7 +220,7 @@ impl Model {
     }
 
     fn draw(&self, batch: &mut Batch, sh: &Shading, pos: Vec3, rot: Quat, scale: Vec3) {
-        let base = batch.reserve(self.verts.len());
+        let base = batch.reserve(self.verts.len(), self.indices.len());
         for &(p, n, c) in &self.verts {
             let world = pos + rot * (p * scale);
             let color = sh.shade(world, (rot * (n / scale)).normalize(), c);
@@ -190,45 +234,75 @@ fn solid(c: Color) -> impl Fn(f32, Vec3) -> Color {
     move |_, _| c
 }
 
-pub struct Models {
+/// The body part meshes of one player, painted in its team's kit.
+pub struct PersonModels {
     trunk: Model,
     thigh: Model,
     shin: Model,
     foot: Model,
     arm: Model,
-    tree: Model,
-    rock: Model,
 }
 
-impl Models {
-    pub fn new() -> Self {
+impl PersonModels {
+    fn new(kit: &Kit) -> Self {
         let mut trunk = Model::new();
         let [hx, hy, hz] = TRUNK_HALF;
         let waist = -hy + 0.18;
-        trunk.cuboid(vec3(0.0, (waist + hy) * 0.5, 0.0), vec3(hx, (hy - waist) * 0.5, hz), SHIRT);
-        trunk.cuboid(vec3(0.0, (waist - hy) * 0.5, 0.0), vec3(hx * 1.02, (waist + hy) * 0.5, hz * 1.02), SHORTS);
+        trunk.cuboid(vec3(0.0, (waist + hy) * 0.5, 0.0), vec3(hx, (hy - waist) * 0.5, hz), kit.shirt);
+        trunk.cuboid(vec3(0.0, (waist - hy) * 0.5, 0.0), vec3(hx * 1.02, (waist + hy) * 0.5, hz * 1.02), kit.shorts);
         trunk.capsule(vec3(0.0, hy + 0.05, 0.0), 0.03, 0.05, solid(SKIN));
-        trunk.sphere(vec3(0.0, HEAD_OFFSET, 0.0), HEAD_RADIUS, |_, n| {
-            if n.y > 0.3 || n.x < -0.25 { HAIR } else { SKIN }
+        let hair = kit.hair;
+        trunk.sphere(vec3(0.0, HEAD_OFFSET, 0.0), HEAD_RADIUS, move |_, n| {
+            if n.y > 0.3 || n.x < -0.25 { hair } else { SKIN }
         });
         for side in [-1.0, 1.0] {
             trunk.sphere(vec3(HEAD_RADIUS * 0.88, HEAD_OFFSET + 0.02, 0.04 * side), 0.018, solid(EYE));
         }
 
         let mut thigh = Model::new();
-        thigh.capsule(Vec3::ZERO, THIGH_HALF_LEN, THIGH_RADIUS, |y, _| if y > -0.02 { SHORTS } else { SKIN });
+        let shorts = kit.shorts;
+        thigh.capsule(Vec3::ZERO, THIGH_HALF_LEN, THIGH_RADIUS, move |y, _| if y > -0.02 { shorts } else { SKIN });
 
         let mut shin = Model::new();
-        shin.capsule(Vec3::ZERO, SHIN_HALF_LEN, SHIN_RADIUS, |y, _| if y < -0.12 { SOCK } else { SKIN });
+        let socks = kit.socks;
+        shin.capsule(Vec3::ZERO, SHIN_HALF_LEN, SHIN_RADIUS, move |y, _| if y < 0.1 { socks } else { SKIN });
 
         let mut foot = Model::new();
         let [fx, fy, fz] = FOOT_HALF;
-        foot.cuboid(vec3(0.0, 0.006, 0.0), vec3(fx, fy - 0.006, fz), SHOE);
-        foot.cuboid(vec3(0.0, -fy + 0.006, 0.0), vec3(fx * 1.02, 0.006, fz * 1.05), SOCK);
+        foot.cuboid(vec3(0.0, 0.006, 0.0), vec3(fx, fy - 0.006, fz), BOOT);
+        foot.cuboid(vec3(0.0, -fy + 0.006, 0.0), vec3(fx * 1.02, 0.006, fz * 1.05), WHITE);
 
         let mut arm = Model::new();
-        arm.capsule(Vec3::ZERO, ARM_HALF_LEN - 0.04, ARM_RADIUS, |y, _| if y > 0.1 { SHIRT } else { SKIN });
+        let shirt = kit.shirt;
+        arm.capsule(Vec3::ZERO, ARM_HALF_LEN - 0.04, ARM_RADIUS, move |y, _| if y > 0.1 { shirt } else { SKIN });
         arm.sphere(vec3(0.0, -ARM_HALF_LEN + 0.01, 0.0), 0.05, solid(SKIN));
+
+        Self { trunk, thigh, shin, foot, arm }
+    }
+}
+
+pub struct Models {
+    pub people: [PersonModels; 2],
+    ball: Model,
+    tree: Model,
+    rock: Model,
+}
+
+impl Models {
+    pub fn new() -> Self {
+        // A classic ball: black patches around the 12 corners of an icosahedron.
+        let phi = (1.0 + 5f32.sqrt()) * 0.5;
+        let mut patches = Vec::new();
+        for a in [-1.0, 1.0] {
+            for b in [-phi, phi] {
+                patches.extend([vec3(0.0, a, b), vec3(a, b, 0.0), vec3(b, 0.0, a)].map(|v| v.normalize()));
+            }
+        }
+        let mut ball = Model::new();
+        ball.sphere(Vec3::ZERO, BALL_RADIUS, move |_, n| {
+            let n = n.normalize();
+            if patches.iter().any(|p| p.dot(n) > 0.92) { Color::new(0.1, 0.1, 0.12, 1.0) } else { WHITE }
+        });
 
         let mut tree = Model::new();
         tree.capsule(vec3(0.0, 1.5, 0.0), 1.5, 0.18, solid(Color::new(0.4, 0.28, 0.18, 1.0)));
@@ -240,15 +314,11 @@ impl Models {
         let mut rock = Model::new();
         rock.sphere(Vec3::ZERO, 1.0, solid(Color::new(0.52, 0.5, 0.47, 1.0)));
 
-        Self { trunk, thigh, shin, foot, arm, tree, rock }
+        Self { people: [PersonModels::new(&KITS[0]), PersonModels::new(&KITS[1])], ball, tree, rock }
     }
 }
 
-fn quat(rot: [f32; 4]) -> Quat {
-    Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3])
-}
-
-pub fn draw_person(batch: &mut Batch, sh: &Shading, models: &Models, parts: &[PartPose]) {
+pub fn draw_person(batch: &mut Batch, sh: &Shading, models: &PersonModels, parts: &[PartPose]) {
     for p in parts {
         let model = match p.kind {
             PartKind::Trunk => &models.trunk,
@@ -257,14 +327,18 @@ pub fn draw_person(batch: &mut Batch, sh: &Shading, models: &Models, parts: &[Pa
             PartKind::Foot => &models.foot,
             PartKind::Arm => &models.arm,
         };
-        model.draw(batch, sh, Vec3::from(p.pos), quat(p.rot), Vec3::ONE);
+        model.draw(batch, sh, p.pos, p.rot, Vec3::ONE);
     }
 }
 
-/// Soft dark blobs under each body part; they shrink and fade with height.
-pub fn draw_shadows(batch: &mut Batch, parts: &[PartPose]) {
-    for p in parts {
-        let pos = Vec3::from(p.pos);
+pub fn draw_ball(batch: &mut Batch, sh: &Shading, models: &Models, pos: Vec3, rot: Quat) {
+    models.ball.draw(batch, sh, pos, rot, Vec3::ONE);
+}
+
+/// Soft dark blobs under each body part and the ball; they shrink and fade
+/// with height.
+pub fn draw_shadows(batch: &mut Batch, parts: &[PartPose], ball: Vec3) {
+    let blobs = parts.iter().map(|p| {
         let size = match p.kind {
             PartKind::Trunk => 0.3,
             PartKind::Thigh => 0.12,
@@ -272,12 +346,15 @@ pub fn draw_shadows(batch: &mut Batch, parts: &[PartPose]) {
             PartKind::Foot => 0.15,
             PartKind::Arm => 0.08,
         };
+        (p.pos, size)
+    });
+    for (pos, size) in blobs.chain(std::iter::once((ball, BALL_RADIUS * 1.1))) {
         let fade = (1.0 - pos.y / 2.5).clamp(0.0, 1.0);
         batch.disc(vec3(pos.x - pos.y * 0.25, 0.012, pos.z + pos.y * 0.2), size * 1.3, size, Color::new(0.0, 0.0, 0.0, 0.35 * fade));
     }
 }
 
-/// The field: grass, a running track with distance lines, trees and rocks.
+/// The pitch with its lines, walls and goals, and trees and rocks around it.
 pub struct Scenery {
     trees: Vec<(Vec3, f32, f32)>,
     rocks: Vec<(Vec3, Vec3)>,
@@ -285,36 +362,37 @@ pub struct Scenery {
 
 impl Scenery {
     pub fn new() -> Self {
-        let side = || if gen_range(0, 2) == 0 { -1.0 } else { 1.0 };
-        let trees = (0..260)
+        // Anywhere around the pitch, but not on it.
+        let around = |margin: f32| loop {
+            let pos = vec3(gen_range(-60.0, 60.0), 0.0, gen_range(-45.0, 45.0));
+            if pos.x.abs() > HALF_LENGTH + GOAL_DEPTH + margin || pos.z.abs() > HALF_WIDTH + margin {
+                return pos;
+            }
+        };
+        let trees = (0..70).map(|_| (around(8.0), gen_range(0.8, 1.5), gen_range(0.0, std::f32::consts::TAU))).collect();
+        let rocks = (0..40)
             .map(|_| {
-                let pos = vec3(gen_range(-80.0, 700.0), 0.0, side() * gen_range(6.0, 45.0));
-                (pos, gen_range(0.8, 1.5), gen_range(0.0, std::f32::consts::TAU))
-            })
-            .collect();
-        let rocks = (0..120)
-            .map(|_| {
-                let pos = vec3(gen_range(-80.0, 700.0), 0.0, side() * gen_range(2.5, 30.0));
                 let r = gen_range(0.2, 0.8);
-                (pos, vec3(r * gen_range(1.0, 1.6), r * gen_range(0.4, 0.8), r))
+                (around(3.0), vec3(r * gen_range(1.0, 1.6), r * gen_range(0.4, 0.8), r))
             })
             .collect();
         Self { trees, rocks }
     }
 
-    /// Draws everything within view of the point `focus_x` along the track.
-    /// `record` is the best distance reached so far, marked on the track.
-    pub fn draw(&self, batch: &mut Batch, sh: &Shading, models: &Models, focus_x: f32, record: Option<f32>) {
-        // Grass in 2 m tiles with a gentle checker so motion is easy to see.
+    pub fn draw(&self, batch: &mut Batch, sh: &Shading, models: &Models) {
+        // Grass in 2 m tiles, mowed in stripes across the pitch.
         let tile = 2.0;
-        let x0 = ((focus_x - 60.0) / tile).floor() as i32;
-        let x1 = ((focus_x + 110.0) / tile).ceil() as i32;
-        for ix in x0..x1 {
-            for iz in -30..30 {
+        for ix in -36i32..36 {
+            for iz in -28..28 {
                 let (x, z) = (ix as f32 * tile, iz as f32 * tile);
                 let hash = ((ix * 73 + iz * 151) & 7) as f32 / 7.0;
-                let checker = if (ix + iz) % 2 == 0 { 0.0 } else { 0.025 };
-                let g = Color::new(0.33 + checker + hash * 0.03, 0.58 + checker + hash * 0.05, 0.25 + hash * 0.02, 1.0);
+                let on_pitch = x >= -HALF_LENGTH - 2.0 && x < HALF_LENGTH + 2.0 && z >= -HALF_WIDTH - 2.0 && z < HALF_WIDTH + 2.0;
+                let g = if on_pitch {
+                    let stripe = if ix.rem_euclid(2) == 0 { 0.0 } else { 0.045 };
+                    Color::new(0.27 + stripe, 0.56 + stripe, 0.22 + stripe * 0.5, 1.0)
+                } else {
+                    Color::new(0.35 + hash * 0.03, 0.55 + hash * 0.05, 0.25 + hash * 0.02, 1.0)
+                };
                 batch.quad(
                     sh,
                     [vec3(x, 0.0, z), vec3(x + tile, 0.0, z), vec3(x + tile, 0.0, z + tile), vec3(x, 0.0, z + tile)],
@@ -323,55 +401,100 @@ impl Scenery {
             }
         }
 
-        // Running track along +x.
-        let (tx0, tx1) = (focus_x - 60.0, focus_x + 110.0);
-        let lane = 1.1;
-        let y = 0.004;
-        let track = Color::new(0.72, 0.36, 0.26, 1.0);
-        let white = Color::new(0.95, 0.95, 0.92, 1.0);
-        let mut seg = tx0;
-        while seg < tx1 {
-            let e = (seg + 10.0).min(tx1);
-            batch.quad(sh, [vec3(seg, y, -lane), vec3(e, y, -lane), vec3(e, y, lane), vec3(seg, y, lane)], track);
-            for zl in [-lane, lane] {
-                batch.quad(sh, [vec3(seg, y * 2.0, zl - 0.04), vec3(e, y * 2.0, zl - 0.04), vec3(e, y * 2.0, zl + 0.04), vec3(seg, y * 2.0, zl + 0.04)], white);
-            }
-            seg = e;
+        // Pitch markings.
+        let (l, w, y, lw) = (HALF_LENGTH - 0.1, HALF_WIDTH - 0.1, 0.006, 0.1);
+        let corners = [vec2(-l, -w), vec2(l, -w), vec2(l, w), vec2(-l, w)];
+        for i in 0..4 {
+            batch.ground_line(sh, corners[i], corners[(i + 1) % 4], lw, y, WHITE);
         }
-        let first = tx0.ceil().max(0.0) as i32;
-        for m in first..tx1 as i32 {
-            let x = m as f32;
-            let w = if m == 0 { 0.12 } else if m % 5 == 0 { 0.06 } else { 0.015 };
-            let reach = if m % 5 == 0 { lane } else { 0.25 };
-            batch.quad(sh, [vec3(x - w, y * 2.0, -reach), vec3(x + w, y * 2.0, -reach), vec3(x + w, y * 2.0, reach), vec3(x - w, y * 2.0, reach)], white);
-            if m % 5 == 0 {
-                // Distance post beside the track.
-                let post = vec3(x, 0.0, -lane - 0.4);
-                batch.quad(sh, [post + vec3(-0.04, 0.0, 0.0), post + vec3(0.04, 0.0, 0.0), post + vec3(0.04, 0.9, 0.0), post + vec3(-0.04, 0.9, 0.0)], white);
-                batch.quad(sh, [post + vec3(-0.25, 0.9, 0.0), post + vec3(0.25, 0.9, 0.0), post + vec3(0.25, 1.2, 0.0), post + vec3(-0.25, 1.2, 0.0)], white);
+        batch.ground_line(sh, vec2(0.0, -w), vec2(0.0, w), lw, y, WHITE);
+        let ring = |batch: &mut Batch, c: Vec2, r: f32| {
+            let n = 48;
+            for i in 0..n {
+                let a = |k: i32| k as f32 / n as f32 * std::f32::consts::TAU;
+                batch.ground_line(sh, c + Vec2::from_angle(a(i)) * r, c + Vec2::from_angle(a(i + 1)) * r, lw, y, WHITE);
             }
+        };
+        ring(batch, Vec2::ZERO, 3.0);
+        ring(batch, Vec2::ZERO, 0.12);
+        for s in [-1.0f32, 1.0] {
+            // Goal area and penalty spot.
+            let (front, half) = (s * (l - 2.5), GOAL_HALF_WIDTH + 1.5);
+            batch.ground_line(sh, vec2(s * l, -half), vec2(front, -half), lw, y, WHITE);
+            batch.ground_line(sh, vec2(front, -half), vec2(front, half), lw, y, WHITE);
+            batch.ground_line(sh, vec2(front, half), vec2(s * l, half), lw, y, WHITE);
+            ring(batch, vec2(s * (l - 5.0), 0.0), 0.12);
         }
 
-        // The current record, as a gold line and flag.
-        if let Some(r) = record {
-            let gold = Color::new(1.0, 0.8, 0.15, 1.0);
-            batch.quad(sh, [vec3(r - 0.05, y * 3.0, -lane), vec3(r + 0.05, y * 3.0, -lane), vec3(r + 0.05, y * 3.0, lane), vec3(r - 0.05, y * 3.0, lane)], gold);
-            let pole = vec3(r, 0.0, lane + 0.3);
-            batch.quad(sh, [pole + vec3(-0.025, 0.0, 0.0), pole + vec3(0.025, 0.0, 0.0), pole + vec3(0.025, 1.8, 0.0), pole + vec3(-0.025, 1.8, 0.0)], white);
-            batch.quad(sh, [pole + vec3(0.0, 1.8, 0.0), pole + vec3(0.6, 1.65, 0.0), pole + vec3(0.6, 1.4, 0.0), pole + vec3(0.0, 1.35, 0.0)], gold);
+        self.draw_walls(batch, sh);
+        for s in [-1.0, 1.0] {
+            draw_goal(batch, sh, s);
         }
 
         for &(pos, scale, spin) in &self.trees {
-            if pos.x > tx0 && pos.x < tx1 {
-                let s = Vec3::splat(scale);
-                models.tree.draw(batch, sh, pos, Quat::from_rotation_y(spin), s);
-            }
+            models.tree.draw(batch, sh, pos, Quat::from_rotation_y(spin), Vec3::splat(scale));
         }
         for &(pos, size) in &self.rocks {
-            if pos.x > tx0 && pos.x < tx1 {
-                models.rock.draw(batch, sh, pos, Quat::IDENTITY, size);
+            models.rock.draw(batch, sh, pos, Quat::IDENTITY, size);
+        }
+    }
+
+    /// Low boards all around the pitch, open at the goals. The ball bounces
+    /// off them.
+    fn draw_walls(&self, batch: &mut Batch, sh: &Shading) {
+        let board = Color::new(0.16, 0.3, 0.55, 1.0);
+        let (l, w, t, h) = (HALF_LENGTH, HALF_WIDTH, 0.06, 0.9);
+        for s in [-1.0, 1.0] {
+            // Long sides.
+            batch.cuboid(sh, vec3(0.0, h * 0.5, s * (w + t)), vec3(l + 2.0 * t, h * 0.5, t), board);
+            batch.cuboid(sh, vec3(0.0, h + 0.02, s * (w + t)), vec3(l + 2.0 * t, 0.02, t * 1.2), WHITE);
+            // Ends, on either side of the goal.
+            let len = (w - GOAL_HALF_WIDTH) * 0.5;
+            for zs in [-1.0, 1.0] {
+                let zc = zs * (GOAL_HALF_WIDTH + len);
+                batch.cuboid(sh, vec3(s * (l + t), h * 0.5, zc), vec3(t, h * 0.5, len), board);
+                batch.cuboid(sh, vec3(s * (l + t), h + 0.02, zc), vec3(t * 1.2, 0.02, len), WHITE);
             }
         }
+    }
+}
+
+/// Goal frame and net at the end `s` (+1 or -1) of the pitch.
+fn draw_goal(batch: &mut Batch, sh: &Shading, s: f32) {
+    let (x, gw, gh, d) = (s * HALF_LENGTH, GOAL_HALF_WIDTH, GOAL_HEIGHT, GOAL_DEPTH);
+    let r = 0.06;
+    for z in [-gw - r, gw + r] {
+        batch.cuboid(sh, vec3(x, gh * 0.5, z), vec3(r, gh * 0.5 + r, r), WHITE);
+    }
+    batch.cuboid(sh, vec3(x, gh + r, 0.0), vec3(r, r, gw + 2.0 * r), WHITE);
+
+    // The net: a grid of thin strings on the back, sides and roof.
+    let net = Color::new(0.85, 0.87, 0.9, 1.0);
+    let back = x + s * d;
+    let k = 0.012;
+    let gap = 0.25;
+    let mut z = -gw;
+    while z <= gw + 0.01 {
+        batch.cuboid(sh, vec3(back, gh * 0.5, z), vec3(k, gh * 0.5, k), net);
+        batch.cuboid(sh, vec3(x + s * d * 0.5, gh, z), vec3(d * 0.5, k, k), net);
+        z += gap;
+    }
+    let mut yy = 0.0;
+    while yy <= gh + 0.01 {
+        batch.cuboid(sh, vec3(back, yy, 0.0), vec3(k, k, gw), net);
+        for zs in [-gw, gw] {
+            batch.cuboid(sh, vec3(x + s * d * 0.5, yy, zs), vec3(d * 0.5, k, k), net);
+        }
+        yy += gap;
+    }
+    let mut dx = 0.0;
+    while dx <= d + 0.01 {
+        let xx = x + s * dx;
+        batch.cuboid(sh, vec3(xx, gh, 0.0), vec3(k, k, gw), net);
+        for zs in [-gw, gw] {
+            batch.cuboid(sh, vec3(xx, gh * 0.5, zs), vec3(k, gh * 0.5, k), net);
+        }
+        dx += gap;
     }
 }
 

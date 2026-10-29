@@ -1,23 +1,27 @@
-//! A small feed-forward neural network that drives one side of the walker's
-//! body. The same network runs for the left and the right side (with mirrored
-//! inputs and half a gait cycle apart), so gaits come out symmetric.
+//! A small feed-forward neural network that controls one soccer player.
+//! Everything it senses is measured relative to the player itself (ahead of
+//! it, to its left), so the same brain can play for either team.
 //!
 //! The weights are found by evolution strategies (see trainer.rs), not by
-//! backpropagation.
+//! backpropagation. Brains can be saved to and loaded from text files.
+
+use std::path::Path;
 
 use macroquad::rand::gen_range;
 
 /// Names of the sensor inputs, shown in the brain viewer.
 pub const INPUT_LABELS: [&str; 18] = [
-    "phase sin", "phase cos", "lean fwd", "lean side", "lean fwd v", "lean side v", "height",
-    "speed fwd", "speed side", "hip", "hip out", "knee", "ankle", "other hip", "other knee",
-    "foot down", "other foot", "bias",
+    "ball ahead", "ball left", "ball dist", "ball v ahead", "ball v left", "ball height", "opp ahead",
+    "opp left", "goal ahead", "goal left", "own goal ahd", "own goal left", "speed ahead", "speed left",
+    "field x", "field z", "ball close", "bias",
 ];
-pub const OUTPUT_LABELS: [&str; 5] = ["hip", "hip out", "knee", "ankle", "shoulder"];
+pub const OUTPUT_LABELS: [&str; 5] = ["run", "strafe", "turn", "kick", "lift"];
 
 pub const INPUTS: usize = INPUT_LABELS.len();
-pub const HIDDEN: usize = 16;
+pub const HIDDEN: usize = 24;
 pub const OUTPUTS: usize = OUTPUT_LABELS.len();
+
+const FILE_HEADER: &str = "soccer-brain v1";
 
 /// A fully connected layer. Weights are stored row-major, one row per
 /// output neuron, with the bias as the last element of each row.
@@ -60,15 +64,13 @@ impl Layer {
 pub struct Brain {
     pub layers: Vec<Layer>,
     /// Activations of every layer from the last `think` call, input layer
-    /// first. Kept so the HUD can visualize what the creature is "thinking".
+    /// first. Kept so the HUD can visualize what the player is "thinking".
     pub activations: Vec<Vec<f32>>,
 }
 
 impl Brain {
-    /// A random brain with small output weights, so it starts out holding
-    /// roughly the default standing pose instead of flailing.
     pub fn random() -> Self {
-        let layers = vec![Layer::random(INPUTS, HIDDEN, 1.5), Layer::random(HIDDEN, OUTPUTS, 0.4)];
+        let layers = vec![Layer::random(INPUTS, HIDDEN, 1.5), Layer::random(HIDDEN, OUTPUTS, 1.0)];
         Self::from_layers(layers)
     }
 
@@ -77,11 +79,11 @@ impl Brain {
     }
 
     /// Rebuilds a brain from `weights()` output, or None if the size doesn't
-    /// match the current network shape.
+    /// match the current network shape or a weight isn't a finite number.
     pub fn from_weights(weights: &[f32]) -> Option<Self> {
         let mut layers = vec![Layer::random(INPUTS, HIDDEN, 1.0), Layer::random(HIDDEN, OUTPUTS, 1.0)];
         let total: usize = layers.iter().map(|l| l.weights.len()).sum();
-        if weights.len() != total {
+        if weights.len() != total || !weights.iter().all(|w| w.is_finite()) {
             return None;
         }
         let mut rest = weights;
@@ -110,6 +112,48 @@ impl Brain {
         out.copy_from_slice(self.activations.last().unwrap());
         out
     }
+
+    /// The brain as a text file: a header, the number of generations it has
+    /// trained for, the network shape, and then all weights.
+    pub fn to_text(&self, generation: u32) -> String {
+        let weights: Vec<String> = self.weights().map(|w| w.to_string()).collect();
+        format!("{FILE_HEADER}\n{generation}\n{INPUTS} {HIDDEN} {OUTPUTS}\n{}\n", weights.join(" "))
+    }
+
+    /// Parses `to_text` output into a brain and its generation.
+    pub fn from_text(text: &str) -> Result<(Self, u32), String> {
+        let mut lines = text.lines();
+        if lines.next().map(str::trim) != Some(FILE_HEADER) {
+            return Err("not a soccer brain file".into());
+        }
+        let generation = lines
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .ok_or("the generation number is missing")?;
+        let shape = lines.next().unwrap_or("").trim().to_string();
+        let expected = format!("{INPUTS} {HIDDEN} {OUTPUTS}");
+        if shape != expected {
+            return Err(format!("the network shape is {shape}, but this version needs {expected}"));
+        }
+        let weights: Vec<f32> = lines
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .map(|w| w.parse())
+            .collect::<Result<_, _>>()
+            .map_err(|_| "a weight is not a number")?;
+        let brain = Self::from_weights(&weights).ok_or("the weights are damaged or incomplete")?;
+        Ok((brain, generation))
+    }
+
+    pub fn save(&self, path: &Path, generation: u32) -> std::io::Result<()> {
+        std::fs::write(path, self.to_text(generation))
+    }
+
+    pub fn load(path: &Path) -> Result<(Self, u32), String> {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        Self::from_text(&text)
+    }
 }
 
 /// Standard normal sample via Box-Muller.
@@ -117,4 +161,18 @@ pub fn gaussian() -> f32 {
     let u1: f32 = gen_range(1e-6, 1.0);
     let u2: f32 = gen_range(0.0, 1.0);
     (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_round_trip() {
+        let brain = Brain::random();
+        let (loaded, generation) = Brain::from_text(&brain.to_text(42)).unwrap();
+        assert_eq!(generation, 42);
+        assert!(brain.weights().eq(loaded.weights()));
+        assert!(Brain::from_text("walker-brain v1\n3\n1 2 3\n").is_err());
+    }
 }
