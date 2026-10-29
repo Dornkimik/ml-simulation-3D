@@ -411,9 +411,10 @@ mod tests {
         let (mut goals, mut restarts) = ([0, 0], 0);
         let mut brains = [learners[0].es.brain(), learners[1].es.brain()];
         for k in 0..20 {
-            let mut game = crate::soccer::Match::new(k, 45.0, 0.0);
+            let mut game = crate::soccer::Match::new(k, 45.0, 1.5);
             while !game.over() {
                 game.step(&mut brains);
+                crate::soccer::tests::assert_ball_legal(&game);
             }
             goals[0] += game.score[0];
             goals[1] += game.score[1];

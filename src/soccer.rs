@@ -23,6 +23,7 @@ pub const HALF_WIDTH: f32 = 9.0;
 pub const GOAL_HALF_WIDTH: f32 = 2.5;
 pub const GOAL_HEIGHT: f32 = 2.0;
 pub const GOAL_DEPTH: f32 = 1.2;
+pub const POST_RADIUS: f32 = 0.06;
 pub const BALL_RADIUS: f32 = 0.11;
 pub const PLAYER_RADIUS: f32 = 0.3;
 const PLAYER_HEIGHT: f32 = 1.8;
@@ -37,7 +38,11 @@ const KICK_MIN_SPEED: f32 = 4.0;
 const KICK_MAX_SPEED: f32 = 16.0;
 const GRAVITY: f32 = 9.81;
 const WALL_BOUNCE: f32 = 0.6;
+const POST_BOUNCE: f32 = 0.6;
 const NET_BOUNCE: f32 = 0.15;
+/// The ball moves in smaller steps than the players, so even the hardest
+/// shot can't skip through a post or a wall between two steps.
+const BALL_SUBSTEPS: usize = 4;
 /// How bouncy the ball is when a player runs into it (low, so it can be dribbled).
 const BODY_BOUNCE: f32 = 0.3;
 /// If the ball stays within `STALL_DISTANCE` of one spot for this long (say,
@@ -93,11 +98,47 @@ impl Player {
 pub struct Ball {
     pub pos: Vec3,
     pub vel: Vec3,
+    /// Behind a goal line, having crossed it through the goal mouth. Only
+    /// then is the ball held by the net instead of bouncing off the wall.
+    in_goal: bool,
 }
 
 impl Ball {
+    fn at_rest(pos: Vec3) -> Self {
+        Self { pos, vel: Vec3::ZERO, in_goal: false }
+    }
+
     fn ground_pos(&self) -> Vec2 {
         vec2(self.pos.x, self.pos.z)
+    }
+
+    /// Pushes the ball out of a round bar (a post or the crossbar) and
+    /// bounces it off. `offset` goes from the bar's axis to the ball's
+    /// center, at right angles to the bar.
+    fn bounce_off_bar(&mut self, offset: Vec3) {
+        let dist = offset.length();
+        let min = BALL_RADIUS + POST_RADIUS;
+        if dist >= min || dist < 1e-6 {
+            return;
+        }
+        let n = offset / dist;
+        self.pos += n * (min - dist);
+        let into = self.vel.dot(n);
+        if into < 0.0 {
+            self.vel -= n * into * (1.0 + POST_BOUNCE);
+        }
+    }
+}
+
+fn clamp_to_pitch(p: &mut Player) {
+    let (lx, lz) = (HALF_LENGTH - PLAYER_RADIUS, HALF_WIDTH - PLAYER_RADIUS);
+    if p.pos.x.abs() > lx {
+        p.pos.x = lx.copysign(p.pos.x);
+        p.vel.x = 0.0;
+    }
+    if p.pos.y.abs() > lz {
+        p.pos.y = lz.copysign(p.pos.y);
+        p.vel.y = 0.0;
     }
 }
 
@@ -145,7 +186,7 @@ impl Match {
         let idle = || Player { pos: Vec2::ZERO, vel: Vec2::ZERO, facing: 0.0, cooldown: 0.0, kicks: 0 };
         let mut m = Self {
             players: [idle(), idle()],
-            ball: Ball { pos: Vec3::ZERO, vel: Vec3::ZERO },
+            ball: Ball::at_rest(Vec3::ZERO),
             time: 0.0,
             duration,
             score: [0, 0],
@@ -171,7 +212,7 @@ impl Match {
     /// roughly toward the opponent's goal.
     fn kickoff(&mut self) {
         let r = &mut self.rng;
-        self.ball = Ball { pos: vec3(0.0, BALL_RADIUS, r.range(-3.0, 3.0)), vel: Vec3::ZERO };
+        self.ball = Ball::at_rest(vec3(0.0, BALL_RADIUS, r.range(-3.0, 3.0)));
         for (team, p) in self.players.iter_mut().enumerate() {
             let s = team_sign(team);
             p.pos = vec2(-s * r.range(4.0, 7.0), r.range(-5.0, 5.0));
@@ -256,7 +297,6 @@ impl Match {
 
         let before = self.ball.pos.x;
         self.update_ball();
-        self.collide_ball_with_players();
         let moved = self.ball.pos.x - before;
         self.tally[0].ball_progress += moved;
         self.tally[1].ball_progress -= moved;
@@ -267,6 +307,9 @@ impl Match {
         self.time += DT;
         self.steps += 1;
         self.check_goal();
+        if self.celebrating > 0.0 {
+            return;
+        }
 
         if self.ball.ground_pos().distance(self.stall_spot) > STALL_DISTANCE {
             self.stall_spot = self.ball.ground_pos();
@@ -288,16 +331,7 @@ impl Match {
         p.vel += (desired - p.vel).clamp_length_max(ACCELERATION * DT);
         p.pos += p.vel * DT;
         p.cooldown = (p.cooldown - DT).max(0.0);
-
-        let (lx, lz) = (HALF_LENGTH - PLAYER_RADIUS, HALF_WIDTH - PLAYER_RADIUS);
-        if p.pos.x.abs() > lx {
-            p.pos.x = lx.copysign(p.pos.x);
-            p.vel.x = 0.0;
-        }
-        if p.pos.y.abs() > lz {
-            p.pos.y = lz.copysign(p.pos.y);
-            p.vel.y = 0.0;
-        }
+        clamp_to_pitch(p);
     }
 
     /// Kicks the ball where the player is facing, if it wants to and can.
@@ -333,27 +367,58 @@ impl Match {
             a.vel += n * closing * 0.5;
             b.vel -= n * closing * 0.5;
         }
+        // Being bumped mustn't push anyone through a wall.
+        clamp_to_pitch(a);
+        clamp_to_pitch(b);
     }
 
+    /// Moves the ball through one control step, in substeps.
     fn update_ball(&mut self) {
+        let h = DT / BALL_SUBSTEPS as f32;
+        for _ in 0..BALL_SUBSTEPS {
+            let b = &mut self.ball;
+            let r = BALL_RADIUS;
+            let prev = b.pos;
+            b.vel.y -= GRAVITY * h;
+            b.pos += b.vel * h;
+
+            if b.pos.y < r {
+                b.pos.y = r;
+                b.vel.y = if b.vel.y < -1.0 { -b.vel.y * 0.55 } else { 0.0 };
+            }
+            // Rolling friction on the grass, light air drag in flight.
+            let on_ground = b.pos.y <= r + 1e-3;
+            let ground = vec2(b.vel.x, b.vel.z);
+            let speed = ground.length();
+            if speed > 0.0 {
+                let slowed = if on_ground { speed * (-0.6 * h).exp() - 0.25 * h } else { speed * (-0.05 * h).exp() };
+                let ground = ground * (slowed.max(0.0) / speed);
+                b.vel.x = ground.x;
+                b.vel.z = ground.y;
+            }
+
+            self.collide_ball_with_pitch(prev);
+            self.collide_ball_with_players();
+        }
+    }
+
+    /// Keeps the ball inside the walls, bounces it off the goal frames, and
+    /// lets it into a goal only through the goal mouth. `prev` is where the
+    /// ball was before it last moved.
+    fn collide_ball_with_pitch(&mut self, prev: Vec3) {
         let b = &mut self.ball;
         let r = BALL_RADIUS;
-        b.vel.y -= GRAVITY * DT;
-        b.pos += b.vel * DT;
 
-        if b.pos.y < r {
-            b.pos.y = r;
-            b.vel.y = if b.vel.y < -1.0 { -b.vel.y * 0.55 } else { 0.0 };
-        }
-        // Rolling friction on the grass, light air drag in flight.
-        let on_ground = b.pos.y <= r + 1e-3;
-        let ground = vec2(b.vel.x, b.vel.z);
-        let speed = ground.length();
-        if speed > 0.0 {
-            let slowed = if on_ground { speed * (-0.6 * DT).exp() - 0.25 * DT } else { speed * (-0.05 * DT).exp() };
-            let ground = ground * (slowed.max(0.0) / speed);
-            b.vel.x = ground.x;
-            b.vel.z = ground.y;
+        // Posts and crossbars.
+        for x in [-HALF_LENGTH, HALF_LENGTH] {
+            if b.pos.y < GOAL_HEIGHT + POST_RADIUS {
+                for z in [-GOAL_HALF_WIDTH - POST_RADIUS, GOAL_HALF_WIDTH + POST_RADIUS] {
+                    b.bounce_off_bar(vec3(b.pos.x - x, 0.0, b.pos.z - z));
+                }
+            }
+            if b.pos.z.abs() < GOAL_HALF_WIDTH + POST_RADIUS {
+                b.bounce_off_bar(vec3(b.pos.x - x, b.pos.y - (GOAL_HEIGHT + POST_RADIUS), 0.0));
+            }
         }
 
         // Side walls.
@@ -363,32 +428,43 @@ impl Match {
                 b.vel.z *= -WALL_BOUNCE;
             }
         }
-        // End walls, open at the goal mouths. Behind the goal line the net
-        // holds the ball.
+
         let side = b.pos.x.signum();
         let x = b.pos.x.abs();
-        if x > HALF_LENGTH - r {
-            let in_goal = x > HALF_LENGTH;
-            let in_mouth = b.pos.z.abs() < GOAL_HALF_WIDTH - r && b.pos.y < GOAL_HEIGHT - r;
-            if in_goal || in_mouth {
-                let back = HALF_LENGTH + GOAL_DEPTH - r;
-                if x > back {
-                    b.pos.x = side * back;
-                    if b.vel.x * side > 0.0 {
-                        b.vel.x *= -NET_BOUNCE;
-                    }
+        if !b.in_goal && x > HALF_LENGTH && prev.x.abs() <= HALF_LENGTH {
+            // The ball's center crossed a goal line: where?
+            let t = (HALF_LENGTH - prev.x.abs()) / (x - prev.x.abs());
+            let at = prev + (b.pos - prev) * t;
+            b.in_goal = at.z.abs() < GOAL_HALF_WIDTH && at.y < GOAL_HEIGHT;
+        } else if b.in_goal && x < HALF_LENGTH {
+            // Back out onto the pitch, through the mouth.
+            b.in_goal = false;
+        }
+
+        if b.in_goal {
+            // The net: back, sides and roof.
+            let back = HALF_LENGTH + GOAL_DEPTH - r;
+            if x > back {
+                b.pos.x = side * back;
+                if b.vel.x * side > 0.0 {
+                    b.vel.x *= -NET_BOUNCE;
                 }
-                if in_goal {
-                    if b.pos.z.abs() > GOAL_HALF_WIDTH - r {
-                        b.pos.z = (GOAL_HALF_WIDTH - r).copysign(b.pos.z);
-                        b.vel.z *= -NET_BOUNCE;
-                    }
-                    if b.pos.y > GOAL_HEIGHT - r {
-                        b.pos.y = GOAL_HEIGHT - r;
-                        b.vel.y = b.vel.y.min(0.0);
-                    }
+            }
+            if b.pos.z.abs() > GOAL_HALF_WIDTH - r {
+                b.pos.z = (GOAL_HALF_WIDTH - r).copysign(b.pos.z);
+                if b.vel.z * b.pos.z > 0.0 {
+                    b.vel.z *= -NET_BOUNCE;
                 }
-            } else {
+            }
+            if b.pos.y > GOAL_HEIGHT - r {
+                b.pos.y = GOAL_HEIGHT - r;
+                b.vel.y = b.vel.y.min(0.0);
+            }
+        } else if x > HALF_LENGTH - r {
+            // The end wall, open only at the goal mouth (the posts and
+            // crossbar take care of its edges).
+            let in_mouth = b.pos.z.abs() < GOAL_HALF_WIDTH && b.pos.y < GOAL_HEIGHT;
+            if !in_mouth || x > HALF_LENGTH {
                 b.pos.x = side * (HALF_LENGTH - r);
                 if b.vel.x * side > 0.0 {
                     b.vel.x *= -WALL_BOUNCE;
@@ -397,35 +473,62 @@ impl Match {
         }
     }
 
-    /// Players are solid: running into the ball pushes it along.
+    /// Players are solid upright cylinders: running into the ball pushes it
+    /// along, and a ball dropping onto a head bounces up off it. If the ball
+    /// is pinned against a wall, the player stops instead of pushing it
+    /// through.
     fn collide_ball_with_players(&mut self) {
-        let b = &mut self.ball;
-        if b.pos.y - BALL_RADIUS > PLAYER_HEIGHT {
-            return;
-        }
-        for p in &self.players {
-            let d = vec2(b.pos.x, b.pos.z) - p.pos;
+        let min = PLAYER_RADIUS + BALL_RADIUS;
+        for i in 0..2 {
+            let p = &self.players[i];
+            let d = self.ball.ground_pos() - p.pos;
             let dist = d.length();
-            let min = PLAYER_RADIUS + BALL_RADIUS;
-            if dist >= min || dist < 1e-6 {
+            let below_top = PLAYER_HEIGHT - (self.ball.pos.y - BALL_RADIUS);
+            if dist >= min || below_top <= 0.0 {
                 continue;
             }
-            let n = d / dist;
-            b.pos.x = p.pos.x + n.x * min;
-            b.pos.z = p.pos.y + n.y * min;
+            // Leave the player the shorter way: up over the top, or out sideways.
+            if below_top < min - dist {
+                let b = &mut self.ball;
+                b.pos.y += below_top;
+                if b.vel.y < 0.0 {
+                    b.vel.y *= -BODY_BOUNCE;
+                }
+                continue;
+            }
+            let n = if dist > 1e-6 { d / dist } else { p.dir() };
+            let (p_pos, p_vel) = (p.pos, p.vel);
+            let b = &mut self.ball;
+            let before = b.pos;
+            b.pos.x = p_pos.x + n.x * min;
+            b.pos.z = p_pos.y + n.y * min;
             let mut v = vec2(b.vel.x, b.vel.z);
-            let closing = (v - p.vel).dot(n);
+            let closing = (v - p_vel).dot(n);
             if closing < 0.0 {
                 v -= n * closing * (1.0 + BODY_BOUNCE);
                 b.vel.x = v.x;
                 b.vel.z = v.y;
+            }
+
+            self.collide_ball_with_pitch(before);
+            let ball = self.ball.ground_pos();
+            let p = &mut self.players[i];
+            let d = ball - p.pos;
+            if d.length() < min - 1e-4 {
+                let n = d.try_normalize().unwrap_or(n);
+                p.pos = ball - n * min;
+                let into = p.vel.dot(n);
+                if into > 0.0 {
+                    p.vel -= n * into;
+                }
+                clamp_to_pitch(p);
             }
         }
     }
 
     fn check_goal(&mut self) {
         let b = &self.ball;
-        if b.pos.x.abs() < HALF_LENGTH + BALL_RADIUS || b.pos.z.abs() > GOAL_HALF_WIDTH {
+        if !b.in_goal || b.pos.x.abs() < HALF_LENGTH + BALL_RADIUS {
             return;
         }
         let scorer = if b.pos.x > 0.0 { 0 } else { 1 };
@@ -486,7 +589,7 @@ impl Rng {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The same brain on both teams, started from mirror-image positions,
@@ -513,17 +616,143 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ball_in_the_net_is_a_goal() {
-        let mut brains = [Brain::random(), Brain::random()];
-        let mut game = Match::new(1, 10.0, 0.0);
+    /// A brain that ignores its senses: it always runs at `run` (-1..1) and
+    /// never kicks.
+    fn runner(run: f32) -> Brain {
+        let mut brain = Brain::from_weights(&vec![0.0; Brain::random().weights().count()]).unwrap();
+        let out = &mut brain.layers[1];
+        let stride = out.inputs + 1;
+        out.weights[stride - 1] = run.clamp(-0.999, 0.999).atanh();
+        brain
+    }
+
+    /// Players standing still, far from where the ball is.
+    fn quiet_match() -> (Match, [Brain; 2]) {
+        let mut game = Match::new(1, 60.0, 0.0);
         game.players[0].pos = vec2(-10.0, 5.0);
         game.players[1].pos = vec2(-10.0, -5.0);
+        (game, [runner(0.0), runner(0.0)])
+    }
+
+    /// The ball is on the pitch, or inside one of the goals.
+    pub(crate) fn assert_ball_legal(game: &Match) {
+        let (b, r, eps) = (game.ball.pos, BALL_RADIUS, 1e-3);
+        assert!(b.is_finite(), "ball at {b}");
+        assert!(b.y >= r - eps, "ball below the ground at {b}");
+        assert!(b.z.abs() <= HALF_WIDTH - r + eps, "ball through a side wall at {b}");
+        if b.x.abs() > HALF_LENGTH - r + eps {
+            assert!(
+                b.x.abs() <= HALF_LENGTH + GOAL_DEPTH - r + eps && b.z.abs() <= GOAL_HALF_WIDTH && b.y <= GOAL_HEIGHT,
+                "ball through an end wall at {b}"
+            );
+        }
+    }
+
+    /// Steps the match, checking the ball after every step.
+    fn run_checked(game: &mut Match, brains: &mut [Brain; 2], steps: usize) {
+        for _ in 0..steps {
+            game.step(brains);
+            assert_ball_legal(game);
+        }
+    }
+
+    #[test]
+    fn ball_in_the_net_is_a_goal() {
+        let (mut game, mut brains) = quiet_match();
         game.ball.pos = vec3(HALF_LENGTH - 1.0, BALL_RADIUS, 0.5);
         game.ball.vel = vec3(10.0, 0.0, 0.0);
-        for _ in 0..30 {
-            game.step(&mut brains);
-        }
+        run_checked(&mut game, &mut brains, 30);
         assert_eq!(game.score, [1, 0]);
+    }
+
+    #[test]
+    fn hard_shot_at_the_wall_beside_the_goal_bounces_back() {
+        for z in [GOAL_HALF_WIDTH + 0.5, 4.0, HALF_WIDTH - 0.5] {
+            let (mut game, mut brains) = quiet_match();
+            game.ball.pos = vec3(HALF_LENGTH - 0.5, BALL_RADIUS, z);
+            game.ball.vel = vec3(KICK_MAX_SPEED + 2.0, 0.0, 0.0);
+            run_checked(&mut game, &mut brains, 30);
+            assert_eq!(game.score, [0, 0], "a shot at z = {z} went in");
+            assert!(game.ball.vel.x < 0.0, "a shot at z = {z} didn't bounce back");
+        }
+    }
+
+    #[test]
+    fn shot_over_the_bar_is_no_goal() {
+        let (mut game, mut brains) = quiet_match();
+        game.ball.pos = vec3(HALF_LENGTH - 2.0, GOAL_HEIGHT + 0.4, 0.0);
+        game.ball.vel = vec3(KICK_MAX_SPEED, 1.0, 0.0);
+        run_checked(&mut game, &mut brains, 60);
+        assert_eq!(game.score, [0, 0]);
+    }
+
+    #[test]
+    fn shot_at_the_post_bounces_off() {
+        let (mut game, mut brains) = quiet_match();
+        game.ball.pos = vec3(HALF_LENGTH - 2.0, BALL_RADIUS, GOAL_HALF_WIDTH + POST_RADIUS);
+        game.ball.vel = vec3(12.0, 0.0, 0.0);
+        run_checked(&mut game, &mut brains, 60);
+        assert_eq!(game.score, [0, 0]);
+        assert!(game.ball.pos.x < HALF_LENGTH - 0.5, "the ball didn't bounce off the post");
+    }
+
+    /// A player running the ball into a wall must not push it through.
+    #[test]
+    fn ball_pinned_against_a_wall_stays_on_the_pitch() {
+        // Into the end wall beside the goal, into a goal post, and into a
+        // side wall.
+        for (pos, facing) in [(vec2(12.0, 3.2), 0.0), (vec2(12.0, GOAL_HALF_WIDTH + 2.0 * POST_RADIUS), 0.0), (vec2(0.0, HALF_WIDTH - 1.5), PI / 2.0)] {
+            let (mut game, _) = quiet_match();
+            let mut brains = [runner(1.0), runner(0.0)];
+            game.players[0].pos = pos;
+            game.players[0].facing = facing;
+            let dir = game.players[0].dir();
+            game.ball.pos = vec3(pos.x + dir.x * 0.5, BALL_RADIUS, pos.y + dir.y * 0.5);
+            run_checked(&mut game, &mut brains, 180);
+            assert_eq!(game.score, [0, 0], "pushing from {pos} scored");
+            let gap = game.ball.ground_pos().distance(game.players[0].pos);
+            assert!(gap >= PLAYER_RADIUS + BALL_RADIUS - 1e-3, "pushing from {pos}: player and ball overlap ({gap})");
+        }
+    }
+
+    #[test]
+    fn ball_dropping_on_a_head_bounces_up() {
+        let (mut game, mut brains) = quiet_match();
+        let head = game.players[0].pos;
+        game.ball.pos = vec3(head.x + 0.15, PLAYER_HEIGHT + 1.0, head.y);
+        for _ in 0..60 {
+            let prev = game.ball.pos;
+            game.step(&mut brains);
+            assert!(game.ball.ground_pos().distance(vec2(prev.x, prev.z)) < 0.05, "the ball jumped sideways off the head");
+            if game.ball.vel.y > 0.0 {
+                return;
+            }
+        }
+        panic!("the ball never bounced off the head");
+    }
+
+    /// Lots of chaotic matches between random brains (which kick a lot):
+    /// the ball must stay on the pitch, and every goal must have gone in
+    /// through the goal mouth.
+    #[test]
+    fn random_matches_obey_the_walls() {
+        macroquad::rand::srand(11);
+        for seed in 0..60 {
+            let mut brains = [Brain::random(), Brain::random()];
+            let mut game = Match::new(seed, TRAINING_MATCH_SECONDS, 0.0);
+            let mut prev = game.ball.pos;
+            while !game.over() {
+                let goals = game.score;
+                game.step(&mut brains);
+                assert_ball_legal(&game);
+                if game.score != goals {
+                    assert!(
+                        prev.z.abs() < GOAL_HALF_WIDTH && prev.y < GOAL_HEIGHT && prev.x.abs() > HALF_LENGTH - 1.0,
+                        "seed {seed}: goal from a ball that was at {prev}"
+                    );
+                }
+                prev = game.ball.pos;
+            }
+        }
     }
 }

@@ -10,7 +10,7 @@ use crate::pose::{
     PartKind, PartPose, ARM_HALF_LEN, ARM_RADIUS, FOOT_HALF, HEAD_OFFSET, HEAD_RADIUS, SHIN_HALF_LEN, SHIN_RADIUS,
     THIGH_HALF_LEN, THIGH_RADIUS, TRUNK_HALF,
 };
-use crate::soccer::{BALL_RADIUS, GOAL_DEPTH, GOAL_HALF_WIDTH, GOAL_HEIGHT, HALF_LENGTH, HALF_WIDTH};
+use crate::soccer::{BALL_RADIUS, GOAL_DEPTH, GOAL_HALF_WIDTH, GOAL_HEIGHT, HALF_LENGTH, HALF_WIDTH, POST_RADIUS};
 
 pub const SKY_TOP: Color = Color::new(0.33, 0.56, 0.86, 1.0);
 pub const HORIZON: Color = Color::new(0.78, 0.86, 0.93, 1.0);
@@ -462,7 +462,7 @@ impl Scenery {
 /// Goal frame and net at the end `s` (+1 or -1) of the pitch.
 fn draw_goal(batch: &mut Batch, sh: &Shading, s: f32) {
     let (x, gw, gh, d) = (s * HALF_LENGTH, GOAL_HALF_WIDTH, GOAL_HEIGHT, GOAL_DEPTH);
-    let r = 0.06;
+    let r = POST_RADIUS;
     for z in [-gw - r, gw + r] {
         batch.cuboid(sh, vec3(x, gh * 0.5, z), vec3(r, gh * 0.5 + r, r), WHITE);
     }

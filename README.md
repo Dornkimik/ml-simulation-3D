@@ -21,7 +21,8 @@ The first build downloads and compiles macroquad (graphics) and rfd (file dialog
 - **First seconds:** both players wander around at random.
 - **After ~100 generations (a few seconds):** they chase the ball and push it around.
 - **After ~1000 generations (under a minute on a multi-core CPU):** they dribble, turn to aim, and shoot.
-  Between them they score about 6 goals per 45-second match (measured in the test below).
+- **After ~4000 generations (a few minutes):** between them they score about 2 to 3 goals per 45-second match
+  (measured in the test below). Scoring stays hard because each player also learns to defend.
 
 Training keeps going for as long as the window is open. Each player's brain is saved to `blue_brain.txt` /
 `red_brain.txt` every few seconds and on exit, and the next run picks up from there.
@@ -52,8 +53,10 @@ A brain file is plain text: a header, how many generations the brain has trained
 
 **Match** (`src/soccer.rs`): a 28 x 18 m pitch with low boards all around, so the ball bounces off the walls
 instead of going out. The goals are 5 m wide and 2 m high. Players run (up to 6 m/s), turn, and kick in the
-direction they face; running into the ball pushes it along, so they can dribble. The ball rolls, bounces and
-flies in 3D. After a goal, or if the ball stays in one spot for 5 seconds (say, both players are stuck in a corner),
+direction they face; running into the ball pushes it along, so they can dribble, but they can't push it through
+a wall. The ball rolls, bounces and flies in 3D, in four substeps per frame so even the hardest shot can't skip
+through a wall or a post. It bounces off the round posts and crossbar, and a goal only counts if the ball crossed
+the line inside the goal mouth. After a goal, or if the ball stays in one spot for 5 seconds (say, both players are stuck in a corner),
 play restarts from the middle.
 
 **Brain** (`src/brain.rs`): a network with 18 inputs, 24 hidden neurons and 5 outputs that runs 60 times a second.
@@ -96,5 +99,5 @@ cargo test --release -- --nocapture
 ```
 
 This checks that both teams play by the same rules (a mirror-image start gives a mirror-image game), that
-goals count, and that brain files round-trip. It also trains both players for 20 generations, then prints
+goals count, that the ball can never leave the pitch or score from outside the goal mouth (hard shots at the wall, over the bar, at a post, or pushed into a wall), and that brain files round-trip. It also trains both players for 20 generations, then prints
 how they do against untrained brains and against each other. Set `GENERATIONS=1500` for a longer run.
